@@ -7,6 +7,9 @@ mod chain;
 mod commands;
 mod config;
 mod engine;
+mod wallet;
+
+use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
@@ -34,6 +37,31 @@ struct Cli {
 enum Command {
     /// Check the chain, the sequencer, the clock and the wallet before you need them.
     Doctor,
+    /// Create and inspect the encrypted wallet this machine mints with.
+    Wallets {
+        #[command(subcommand)]
+        command: WalletCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum WalletCommand {
+    /// Create a new wallet, encrypted with a passphrase you choose.
+    New {
+        /// Where to write it. An existing file is never overwritten.
+        #[arg(long, short)]
+        path: Option<PathBuf>,
+    },
+    /// Print the address a wallet holds, without unlocking it.
+    Show {
+        #[arg(long, short)]
+        path: Option<PathBuf>,
+    },
+    /// Check that a passphrase opens a wallet. Prints nothing secret.
+    Unlock {
+        #[arg(long, short)]
+        path: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -50,5 +78,13 @@ async fn main() -> std::process::ExitCode {
 
     match cli.command {
         Command::Doctor => commands::doctor::run(&config).await,
+        Command::Wallets { command } => {
+            let at = |p: Option<PathBuf>| p.unwrap_or_else(commands::wallets::default_path);
+            match command {
+                WalletCommand::New { path } => commands::wallets::new_wallet(&at(path)),
+                WalletCommand::Show { path } => commands::wallets::show(&at(path)),
+                WalletCommand::Unlock { path } => commands::wallets::unlock(&at(path)),
+            }
+        }
     }
 }
