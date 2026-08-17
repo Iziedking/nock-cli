@@ -37,6 +37,19 @@ struct Cli {
 enum Command {
     /// Check the chain, the sequencer, the clock and the wallet before you need them.
     Doctor,
+    /// Mint a public stage for yourself. Prints what it would do unless --fire.
+    Mint {
+        /// The NFT contract address.
+        collection: String,
+        /// How many to mint, within the stage's per wallet cap.
+        #[arg(long, short, default_value_t = 1)]
+        quantity: u64,
+        #[arg(long, short)]
+        wallet: Option<PathBuf>,
+        /// Actually send it. Without this nothing is broadcast.
+        #[arg(long)]
+        fire: bool,
+    },
     /// Create and inspect the encrypted wallet this machine mints with.
     Wallets {
         #[command(subcommand)]
@@ -78,6 +91,23 @@ async fn main() -> std::process::ExitCode {
 
     match cli.command {
         Command::Doctor => commands::doctor::run(&config).await,
+        Command::Mint {
+            collection,
+            quantity,
+            wallet,
+            fire,
+        } => {
+            commands::mint::run(
+                &config,
+                commands::mint::MintArgs {
+                    collection: &collection,
+                    quantity,
+                    wallet: &wallet.unwrap_or_else(commands::wallets::default_path),
+                    fire,
+                },
+            )
+            .await
+        }
         Command::Wallets { command } => {
             let at = |p: Option<PathBuf>| p.unwrap_or_else(commands::wallets::default_path);
             match command {
