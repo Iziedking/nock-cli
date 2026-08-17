@@ -1,4 +1,9 @@
 /target
+
+# Wallets. Encrypted, but a keystore in a public repo is a permanent offline
+# brute-force target, so none of these ever belong in git.
 *.keystore
 wallets.json
+nock-wallet.json
+*wallet*.json
 .env

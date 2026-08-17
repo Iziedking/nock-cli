@@ -6,12 +6,23 @@ use zeroize::Zeroizing;
 
 use crate::wallet::keystore::{generate, Keystore, KeystoreError};
 
-/// Where a wallet lives unless told otherwise. Beside the binary rather than in
-/// a config directory, so a user can see the file they are responsible for.
-pub const DEFAULT_PATH: &str = "nock-wallet.json";
-
+/// Where a wallet lives unless told otherwise: `~/.nock/wallet.json`.
+///
+/// Deliberately outside the working directory. The default used to be the
+/// current folder, which meant anyone following the README from inside a git
+/// checkout would commit their keystore. Encrypted is not the same as safe: a
+/// keystore in a public repository is a permanent offline brute-force target.
 pub fn default_path() -> PathBuf {
-    PathBuf::from(DEFAULT_PATH)
+    home().map_or_else(
+        || PathBuf::from("nock-wallet.json"),
+        |h| h.join(".nock").join("wallet.json"),
+    )
+}
+
+fn home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
 }
 
 /// Creates a new wallet, encrypted, and prints only its address.
@@ -33,6 +44,16 @@ pub fn new_wallet(path: &Path) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    // The parent directory may not exist on a first run.
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(err) = std::fs::create_dir_all(parent) {
+                eprintln!("could not create {}: {err}", parent.display());
+                return ExitCode::FAILURE;
+            }
+        }
+    }
 
     let secret = generate();
     println!("\nEncrypting. This takes a moment on purpose.");

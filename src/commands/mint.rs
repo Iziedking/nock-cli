@@ -182,13 +182,24 @@ async fn fire(
     from: Address,
     rpc: Rpc,
 ) -> Result<ExitCode, String> {
-    clock
-        .assert_usable()
-        .map_err(|e| format!("refusing to fire: {e}"))?;
-
-    // Wait, then one write per endpoint.
     let open_at_ms = i64::try_from(drop.start_time).unwrap_or(0) * 1_000;
     let remaining = open_at_ms - clock.now_ms();
+
+    // Drift only matters when there is a moment to hit. For a stage that is
+    // already open there is nothing to be early or late for, so a loose clock is
+    // worth reporting and not worth refusing over. Insisting here would block a
+    // mint that cannot possibly be mistimed.
+    if remaining > 0 {
+        clock
+            .assert_usable()
+            .map_err(|e| format!("refusing to fire at a stage that has not opened: {e}"))?;
+    } else if clock.assert_usable().is_err() {
+        println!(
+            "  Clock is {} ms out, which does not matter here: the stage is already open.
+",
+            clock.drift_ms()
+        );
+    }
     if remaining > READY_BY_SECONDS * 1_000 {
         println!(
             "  Waiting {} seconds for the stage to open.\n",
@@ -199,11 +210,13 @@ async fn fire(
     }
     clock.sleep_until(open_at_ms).await;
 
-    // Drift can appear during the wait, so this is checked again rather than
-    // trusted from before.
-    clock
-        .assert_usable()
-        .map_err(|e| format!("refusing to fire, the clock moved during the wait: {e}"))?;
+    // Drift can appear during the wait, so it is checked again rather than
+    // trusted from before. Only when there was a wait to drift across.
+    if remaining > 0 {
+        clock
+            .assert_usable()
+            .map_err(|e| format!("refusing to fire, the clock moved during the wait: {e}"))?;
+    }
 
     let sent = send_everywhere(config, signed).await;
     println!("  {}", sent.summary);
