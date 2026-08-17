@@ -3,6 +3,8 @@ use std::env;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+use crate::chain::rpc::redact;
+
 /// Robinhood Chain.
 pub const CHAIN_ID: u64 = 4663;
 pub const DEFAULT_RPC: &str = "https://rpc.mainnet.chain.robinhood.com";
@@ -30,15 +32,23 @@ pub struct Config {
     private_key: Option<Zeroizing<String>>,
 }
 
-// The key must never reach a log, a panic message or a bug report, and the
-// easiest way to leak one is a derived Debug. This prints whether a key is
-// present and nothing about what it is.
+// No secret may reach a log, a panic message or a bug report, and the easiest
+// way to leak one is a derived Debug.
+//
+// There are TWO secrets here, not one. The private key is the obvious one and is
+// printed as whether it is set and nothing more. The other is the endpoint URLs:
+// an Alchemy style endpoint carries its API key in the path, so a user who points
+// NOCK_RPC_URLS at their own provider has put a credential in this struct.
+// Nearly everyone will, because the public RPC answers in about half a second.
+// Both go through redact(), which is the same function the RPC client already
+// uses for its error messages.
 impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let rpc_urls: Vec<String> = self.rpc_urls.iter().map(|u| redact(u)).collect();
         f.debug_struct("Config")
             .field("chain_id", &self.chain_id)
-            .field("rpc_urls", &self.rpc_urls)
-            .field("sequencer_url", &self.sequencer_url)
+            .field("rpc_urls", &rpc_urls)
+            .field("sequencer_url", &redact(&self.sequencer_url))
             .field("private_key", &self.private_key.as_ref().map(|_| "<set>"))
             .finish()
     }
@@ -153,6 +163,40 @@ mod tests {
             "the key leaked into Debug output"
         );
         assert!(rendered.contains("<set>"));
+    }
+
+    /// The other secret in this struct, and the one the test above cannot see
+    /// because it builds its config from `DEFAULT_RPC`, which carries no key.
+    ///
+    /// A user who points `NOCK_RPC_URLS` at their own Alchemy endpoint has put a
+    /// credential in `Config`, and every `{:?}` of it, in a panic or a bug
+    /// report, would have published it.
+    #[test]
+    fn debug_output_never_contains_an_rpc_api_key() {
+        let secret = "alch_5PcMjJnotarealkey";
+        let config = Config {
+            chain_id: CHAIN_ID,
+            rpc_urls: vec![
+                DEFAULT_RPC.to_owned(),
+                format!("https://robinhood-mainnet.g.alchemy.com/v2/{secret}"),
+            ],
+            // Send-only, but nothing stops a user pointing it at a keyed
+            // provider, so it is redacted on the same terms.
+            sequencer_url: format!("https://sequencer.example.com/v2/{secret}"),
+            private_key: None,
+        };
+
+        let rendered = format!("{config:?}");
+        assert!(
+            !rendered.contains(secret),
+            "an RPC endpoint key leaked into Debug output: {rendered}"
+        );
+        // Redacted rather than dropped: which provider answered is worth knowing
+        // when reading a bug report, so the host must survive.
+        assert!(rendered.contains("robinhood-mainnet.g.alchemy.com"));
+        assert!(rendered.contains("sequencer.example.com"));
+        // The keyless default is still fully readable.
+        assert!(rendered.contains(DEFAULT_RPC));
     }
 
     #[test]
