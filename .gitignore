@@ -1,0 +1,4 @@
+/target
+*.keystore
+wallets.json
+.env

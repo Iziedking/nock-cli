@@ -1,0 +1,54 @@
+[package]
+name = "nock"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.97.1"
+license = "MIT"
+description = "Self-hosted NFT minter for Robinhood Chain. Your keys, your machine, nobody's permission."
+publish = false
+
+[[bin]]
+name = "nock"
+path = "src/main.rs"
+
+# Every version pinned exactly. A minter that drifts under you between builds is
+# a minter that behaves differently at the one moment it matters, and the point
+# of shipping a binary is that everyone runs the same thing.
+[dependencies]
+# Addresses, hashing and RLP. Not the full alloy stack: we need primitives and
+# signing, not a provider abstraction over the RPC we already talk to directly.
+alloy-primitives = { version = "=1.6.1", default-features = false, features = ["k256", "rlp", "std"] }
+alloy-rlp = { version = "=0.3.16", features = ["derive"] }
+k256 = { version = "=0.13.4", default-features = false, features = ["ecdsa"] }
+
+clap = { version = "=4.6.6", features = ["derive"] }
+# rustls rather than native-tls, so the binary carries its own TLS and needs no
+# OpenSSL on the machine it lands on. That is the whole distribution argument.
+reqwest = { version = "=0.12.28", default-features = false, features = ["http2", "json", "rustls-tls"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+thiserror = "=2.0.20"
+tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread", "sync", "time", "net"] }
+zeroize = { version = "=1.9.0", features = ["derive"] }
+hex = "=0.4.3"
+
+[dev-dependencies]
+tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread", "time", "net"] }
+
+# Measured on this dependency set: 4.1 MB. opt-level="z" with a fat LTO and
+# panic="abort" reaches 2.0 MB, but that trades unwinding and speed for two
+# megabytes nobody notices downloading.
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"
+module_name_repetitions = "allow"
