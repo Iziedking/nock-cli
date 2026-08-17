@@ -190,6 +190,9 @@ mod tests {
         assert_eq!(parse_hex_u64("0x1234").unwrap(), 0x1234);
         assert_eq!(parse_hex_u64("1234").unwrap(), 0x1234);
         assert!(parse_hex_u64("0xzz").is_err());
-        assert_eq!(parse_hex_u128("0xde0b6b3a7640000").unwrap(), 1_000_000_000_000_000_000);
+        assert_eq!(
+            parse_hex_u128("0xde0b6b3a7640000").unwrap(),
+            1_000_000_000_000_000_000
+        );
     }
 }

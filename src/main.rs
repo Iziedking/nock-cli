@@ -6,6 +6,7 @@
 mod chain;
 mod commands;
 mod config;
+mod engine;
 
 use clap::{Parser, Subcommand};
 

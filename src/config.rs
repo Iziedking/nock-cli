@@ -148,7 +148,10 @@ mod tests {
             private_key: Some(Zeroizing::new(format!("0x{secret}"))),
         };
         let rendered = format!("{config:?}");
-        assert!(!rendered.contains(secret), "the key leaked into Debug output");
+        assert!(
+            !rendered.contains(secret),
+            "the key leaked into Debug output"
+        );
         assert!(rendered.contains("<set>"));
     }
 

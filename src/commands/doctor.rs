@@ -8,6 +8,7 @@ use zeroize::Zeroizing;
 
 use crate::chain::rpc::{parse_hex_u128, parse_hex_u64, Rpc};
 use crate::config::Config;
+use crate::engine::clock::{Clock, MAX_DRIFT_MS};
 
 /// Everything checked here is something that fails silently at the drop if it is
 /// wrong: an RPC that does not answer, a clock that has drifted, a sequencer
@@ -25,13 +26,28 @@ pub struct Check {
 
 impl Check {
     fn ok(name: &'static str, detail: impl Into<String>) -> Self {
-        Self { name, ok: true, detail: detail.into(), warn: false }
+        Self {
+            name,
+            ok: true,
+            detail: detail.into(),
+            warn: false,
+        }
     }
     fn warn(name: &'static str, detail: impl Into<String>) -> Self {
-        Self { name, ok: true, detail: detail.into(), warn: true }
+        Self {
+            name,
+            ok: true,
+            detail: detail.into(),
+            warn: true,
+        }
     }
     fn fail(name: &'static str, detail: impl Into<String>) -> Self {
-        Self { name, ok: false, detail: detail.into(), warn: false }
+        Self {
+            name,
+            ok: false,
+            detail: detail.into(),
+            warn: false,
+        }
     }
 }
 
@@ -81,7 +97,9 @@ pub async fn collect(config: &Config) -> Vec<Check> {
     // 2. How far along is it? A node parked thousands of blocks back will
     //    happily answer everything else while being useless.
     if chain_ok {
-        match rpc.call::<String>("eth_blockNumber", json!([])).await
+        match rpc
+            .call::<String>("eth_blockNumber", json!([]))
+            .await
             .and_then(|hex| parse_hex_u64(&hex))
         {
             Ok(block) => checks.push(Check::ok("head", format!("block {block}"))),
@@ -101,15 +119,33 @@ pub async fn collect(config: &Config) -> Vec<Check> {
     // healthy send-only endpoint should do. Only a transport failure counts.
     let reachable = !matches!(&result, Err(crate::chain::rpc::RpcError::AllFailed(_)));
     checks.push(if reachable {
-        Check::ok("sequencer", format!("reachable, {} ms", elapsed.as_millis()))
+        Check::ok(
+            "sequencer",
+            format!("reachable, {} ms", elapsed.as_millis()),
+        )
     } else {
         Check::fail(
             "sequencer",
-            result.err().map_or_else(|| "unreachable".to_owned(), |e| e.to_string()),
+            result
+                .err()
+                .map_or_else(|| "unreachable".to_owned(), |e| e.to_string()),
         )
     });
 
-    // 4. A key with no gas looks configured right up until it matters.
+    // 4. A clock that has drifted fires at the wrong moment and never says why.
+    //    Checked here because it is the one problem a user cannot see any other
+    //    way: everything else fails loudly, this one just loses drops.
+    let mut clock = Clock::new();
+    clock.sync().await;
+    checks.push(match clock.assert_usable() {
+        Ok(()) => Check::ok(
+            "clock",
+            format!("{} ms drift, limit is {MAX_DRIFT_MS} ms", clock.drift_ms()),
+        ),
+        Err(err) => Check::fail("clock", err.to_string()),
+    });
+
+    // 5. A key with no gas looks configured right up until it matters.
     checks.push(wallet_check(config, &mut rpc).await);
 
     checks
@@ -117,7 +153,10 @@ pub async fn collect(config: &Config) -> Vec<Check> {
 
 async fn wallet_check(config: &Config, rpc: &mut Rpc) -> Check {
     let Some(key) = config.private_key() else {
-        return Check::fail("wallet", "no NOCK_PRIVATE_KEY set, so nothing can be signed");
+        return Check::fail(
+            "wallet",
+            "no NOCK_PRIVATE_KEY set, so nothing can be signed",
+        );
     };
 
     let body = key.strip_prefix("0x").unwrap_or(key);
@@ -134,7 +173,10 @@ async fn wallet_check(config: &Config, rpc: &mut Rpc) -> Check {
         .await
         .and_then(|hex| parse_hex_u128(&hex))
     {
-        Ok(0) => Check::fail("wallet", format!("{address} holds nothing, which will not cover a mint")),
+        Ok(0) => Check::fail(
+            "wallet",
+            format!("{address} holds nothing, which will not cover a mint"),
+        ),
         Ok(wei) => Check::ok("wallet", format!("{address}, {} ETH", format_eth(wei))),
         Err(err) => Check::fail("wallet", err.to_string()),
     }
@@ -147,7 +189,10 @@ pub fn format_eth(wei: u128) -> String {
     const WEI_PER_ETH: u128 = 1_000_000_000_000_000_000;
     let whole = wei / WEI_PER_ETH;
     let frac = wei % WEI_PER_ETH;
-    format!("{whole}.{frac:018}").trim_end_matches('0').trim_end_matches('.').to_owned()
+    format!("{whole}.{frac:018}")
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_owned()
 }
 
 #[must_use]
