@@ -1,0 +1,14 @@
+# Stored with LF, checked out with whatever the platform uses. Written down so a
+# clone behaves the same way regardless of how each machine has core.autocrlf
+# set, which is the setting that quietly leaves one file with two kinds of line
+# ending and no compiler to complain about it.
+* text=auto
+
+*.rs   text
+*.toml text
+*.md   text
+*.sh   text eol=lf
+
+# Generated, and kept out of diffs so a dependency bump does not bury a real
+# change under three thousand lines.
+Cargo.lock -diff
