@@ -1,21 +1,18 @@
-# Working out your Nock wallet address
+# Your Nock wallet
 
-If you use the Nock bot, it mints into an address that belongs to you and that
-Nock cannot take anything out of. This page is how you check that yourself
-instead of taking our word for it.
+The Nock bot mints into an address that belongs to you. This page is how to
+check that yourself.
 
-Your address is **derived, not assigned**. Anyone can compute it, which means you
-can confirm the one the bot gave you is the one the contracts will actually
-deploy to.
+The address is derived, not assigned. You can work it out and confirm the one
+the bot gave you matches what the contracts will actually deploy.
 
-## The three addresses it comes from
+## The addresses it comes from
 
     factory        0x4BBf69d5b882fDA14903B2b04886AaE5D028A2b2
     implementation 0x3e00521648b09726D662A259450E908C75Bb0651
     dispatcher     0x4Cf29825303898FaC7cb2778f19CE15E1C3bD545
 
-Chain 4663, Robinhood Chain. All three are verified on the explorer, so you can
-read the code rather than the description of it.
+Chain 4663, Robinhood Chain. All three are verified on the explorer.
 
 ## Work out your own
 
@@ -24,16 +21,18 @@ cast call <factory> "minterOf(address)(address)" <your address> \
   --rpc-url https://rpc.mainnet.chain.robinhood.com
 ```
 
-That answers before the account exists. The address is a CREATE2 address worked
-out in advance, which is what lets you register it for an allowlist weeks before
-anybody deploys anything.
+This answers before the account exists. It is a CREATE2 address, computed ahead
+of time, so you can register it for an allowlist weeks before anything is
+deployed there.
 
-## What you can check about it
+It will show no code until your first mint. Anything you send it in the meantime
+is still there when it deploys.
 
-Your own address and the dispatcher are written into the account's own bytecode,
-so the address itself commits to who controls it. Two people cannot share an
-account, and no account can be deployed at your address that answers to somebody
-else.
+## Checking it
+
+Your address and the dispatcher are baked into the account's bytecode. Two
+people cannot share an account, and nobody can deploy an account at your address
+that answers to someone else.
 
 Once it exists:
 
@@ -42,9 +41,8 @@ cast call <your nock wallet> "owner()(address)"      --rpc-url ...   # you
 cast call <your nock wallet> "dispatcher()(address)" --rpc-url ...   # NockBatch
 ```
 
-Read the source and you will find there is no `execute`, no upgrade path, no
-initialiser, and no way to change the owner. Not as a promise: there is no
-function that does it.
+The source has no `execute`, no upgrade path, no initialiser and no setter for
+the owner.
 
 ## Getting your money out
 
@@ -53,35 +51,35 @@ cast send <your nock wallet> "sweep()" \
   --rpc-url https://rpc.mainnet.chain.robinhood.com
 ```
 
-`sweep()` sends the whole balance to `owner()`, which is you, and nowhere else.
-It is callable by **anyone**, which sounds wrong until you notice what it means:
-the caller cannot choose the destination, so a stranger calling it can only push
-your money home. If Nock disappeared tomorrow your funds would not be stuck, and
-you would not need us to release them.
+`sweep()` sends the balance to `owner()`, which is you. The function takes no
+destination argument, so there is nowhere else for it to go.
 
-`rescueERC721` and `rescueERC20` do the same for tokens, and those are owner
-only.
+Anyone can call it, including us and including strangers. That is deliberate: if
+Nock goes away, you do not need us to release your money.
+
+`rescueERC721` and `rescueERC20` move tokens out. Both are owner only.
 
 ## Why it is a contract and not a seed phrase
 
-There is nothing to import into MetaMask, because there is no private key. That
-is the trade: a contract account cannot sign messages, so it cannot claim an
-airdrop that requires a signature. In exchange, Nock can mint for you without
-ever holding a key of yours, and there is no key of yours for anyone to lose.
+There is no private key, so there is nothing to import into MetaMask.
 
-Your NFT does not stay in it either. The account forwards each token to your own
-wallet in the same transaction it mints, so anything that snapshots holders sees
-your real address.
+That costs you something. A contract cannot sign a message, so it cannot claim
+an airdrop that needs one. In exchange, Nock mints for you without ever holding
+a key of yours.
 
-## What the account can and cannot do
+Your NFT does not sit in the account either. It is forwarded to your wallet in
+the same transaction that mints it, so a holder snapshot sees your real address.
+
+## Who can do what
 
 | | |
 |---|---|
 | You | mint through it, sweep it, rescue anything in it |
-| Nock | ask it to mint, with the token going to you and nowhere else |
+| Nock | ask it to mint, with the token going to you |
 | Anyone | call `sweep()`, which pays you |
-| Nobody | change the owner, withdraw to another address, or upgrade it |
+| Nobody | change the owner, withdraw elsewhere, or upgrade it |
 
-On a paid stage the mint price comes out of this account's own balance, which you
-funded. Nock supplies the gas and the ordering slot and never fronts or holds the
-money.
+## Paid stages
+
+The mint price comes out of this account's balance, which you funded. Nock pays
+the gas. Nock never holds the money and never fronts it.
