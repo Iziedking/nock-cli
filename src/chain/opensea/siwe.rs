@@ -46,8 +46,16 @@ pub struct Session {
     pub cookies: String,
 }
 
-/// The `EIP-4361` fields this client sends. No statement and no resources: the
-/// fewer optional lines in the message, the fewer ways to build it wrongly.
+/// The exact statement `OpenSea` expects. It is compared against their own copy,
+/// so it is not ours to shorten, reword or leave out. Captured from a real
+/// sign-in on 2026-08-19.
+pub const STATEMENT: &str = "Click to sign in and accept the OpenSea Terms of Service (https://opensea.io/tos) and Privacy Policy (https://opensea.io/privacy).";
+
+/// The `EIP-4361` fields this client sends.
+///
+/// Sent twice over: as a rendered string for the signature to cover, and as the
+/// same fields in an object for the server to rebuild it from. Both have to say
+/// the same thing or the recovered signer will not be the address claimed.
 #[derive(Debug, Clone)]
 pub struct SiweMessage {
     pub domain: String,
@@ -64,9 +72,10 @@ impl std::fmt::Display for SiweMessage {
         // SIWE verifier compares against.
         write!(
             f,
-            "{} wants you to sign in with your Ethereum account:\n{}\n\nURI: {}\nVersion: 1\nChain ID: {}\nNonce: {}\nIssued At: {}",
+            "{} wants you to sign in with your Ethereum account:\n{}\n\n{}\n\nURI: {}\nVersion: 1\nChain ID: {}\nNonce: {}\nIssued At: {}",
             self.domain,
             self.address.to_checksum(None),
+            STATEMENT,
             self.uri,
             self.chain_id,
             self.nonce,
@@ -168,17 +177,17 @@ pub async fn authenticate(
             .as_secs(),
     );
 
-    let message = SiweMessage {
+    let rendered = SiweMessage {
         domain: "opensea.io".to_owned(),
         address,
         uri: "https://opensea.io".to_owned(),
         chain_id,
-        nonce,
-        issued_at,
+        nonce: nonce.clone(),
+        issued_at: issued_at.clone(),
     }
     .to_string();
 
-    let signature = personal_sign(&message, secret)?;
+    let signature = personal_sign(&rendered, secret)?;
 
     let verify = http
         .post("https://opensea.io/__api/auth/siwe/verify")
@@ -189,10 +198,25 @@ pub async fn authenticate(
         .header("cookie", cookies.clone())
         // domain is sent alongside the message, not only inside it. Measured
         // 2026-08-19: without it the reply is 400 "Domain is required".
+        // The structured shape, measured from a real sign-in. A rendered string
+        // here is refused with "Domain is required", and an object without the
+        // statement with "Unexpected SIWE message statement". chainId is a
+        // string on the wire even though it is a number everywhere else.
         .json(&serde_json::json!({
-            "message": message,
+            "message": {
+                "domain": "opensea.io",
+                "address": address.to_checksum(None),
+                "statement": STATEMENT,
+                "uri": "https://opensea.io",
+                "version": "1",
+                "chainId": chain_id.to_string(),
+                "nonce": nonce,
+                "issuedAt": issued_at,
+                "accountType": "Ethereum",
+            },
             "signature": signature,
-            "domain": "opensea.io",
+            "chainArch": "EVM",
+            "connectorId": "io.nock",
         }))
         .send()
         .await
@@ -275,12 +299,14 @@ mod tests {
         );
         assert_eq!(lines[1], "0x941c2A17C60AD6dAf86CB6438074d57E906adFFA");
         assert_eq!(lines[2], "");
-        assert_eq!(lines[3], "URI: https://opensea.io");
-        assert_eq!(lines[4], "Version: 1");
-        assert_eq!(lines[5], "Chain ID: 4663");
-        assert_eq!(lines[6], "Nonce: abc123");
-        assert_eq!(lines[7], "Issued At: 2026-08-19T00:00:00.000Z");
-        assert_eq!(lines.len(), 8, "no trailing blank line");
+        assert_eq!(lines[3], STATEMENT);
+        assert_eq!(lines[4], "");
+        assert_eq!(lines[5], "URI: https://opensea.io");
+        assert_eq!(lines[6], "Version: 1");
+        assert_eq!(lines[7], "Chain ID: 4663");
+        assert_eq!(lines[8], "Nonce: abc123");
+        assert_eq!(lines[9], "Issued At: 2026-08-19T00:00:00.000Z");
+        assert_eq!(lines.len(), 10, "no trailing blank line");
     }
 
     // Lowercasing the address here is the single most likely way to build a
@@ -291,6 +317,16 @@ mod tests {
         let text = message().to_string();
         assert!(text.contains("0x941c2A17C60AD6dAf86CB6438074d57E906adFFA"));
         assert!(!text.contains("0x941c2a17c60ad6daf86cb6438074d57e906adffa"));
+    }
+
+    // Not ours to reword. OpenSea compares this against their own copy, and any
+    // difference is refused with "Unexpected SIWE message statement".
+    #[test]
+    fn it_uses_the_statement_opensea_actually_expects() {
+        assert!(STATEMENT.starts_with("Click to sign in and accept the OpenSea Terms of Service"));
+        assert!(STATEMENT.contains("https://opensea.io/tos"));
+        assert!(STATEMENT.contains("https://opensea.io/privacy"));
+        assert!(STATEMENT.ends_with('.'));
     }
 
     #[test]
