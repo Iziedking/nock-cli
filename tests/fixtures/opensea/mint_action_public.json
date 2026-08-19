@@ -1,0 +1,37 @@
+{
+  "data": {
+    "swap": {
+      "actions": [
+        {
+          "__typename": "MintAction",
+          "transactionSubmissionData": {
+            "to": "0x00005ea00ac477b1030ce78506496e8c2de24bf5",
+            "data": "0x161ac21f000000000000000000000000941c2a17c60ad6daf86cb6438074d57e906adffa0000000000000000000000000000a26b00c1f0df003000390027140000faa7190000000000000000000000007bd7ec70346f762b8a6296b45eaec65af874aa4b00000000000000000000000000000000000000000000000000000000000000003d958fe2",
+            "value": "0",
+            "chain": {
+              "networkId": 4663,
+              "identifier": "robinhood"
+            }
+          }
+        }
+      ],
+      "errors": []
+    }
+  },
+  "extensions": {
+    "debugInfo": {
+      "additionalInformation": {
+        "x-trace-id": "b9554610fe51ab19270cd96506d9f791",
+        "x-ratelimit-remaining": 4,
+        "x-federation-duration-ms": 99.2,
+        "x-cache": {
+          "graphqlapi": {
+            "status": "BYPASS",
+            "control": "no-store"
+          }
+        },
+        "cache-control": "no-store"
+      }
+    }
+  }
+}

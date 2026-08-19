@@ -108,19 +108,26 @@ pub const NATIVE_TOKEN: &str = "0x0000000000000000000000000000000000000000";
 /// Shape measured 2026-08-19 by asking the server what it required, one field at
 /// a time: `AssetQuantityInput` needs `asset: AssetIdentifier!`, which needs
 /// `chain` and `contractAddress`. The two sides must differ, so a mint is the
-/// native token in and the collection out. Quantity is omitted deliberately:
-/// supplying it means telling `OpenSea` what the mint costs, and the whole point
-/// is that they tell us.
+/// native token in and the collection out.
+///
+/// THE QUANTITY IS NOT OPTIONAL. Leaving it out was tried against the live
+/// service and returns perfectly valid calldata with a quantity word of zero and
+/// a value of zero, which is a transaction that succeeds and mints nothing. The
+/// price only appears once a quantity is asked for.
 pub fn mint_action_variables(
     minter: Address,
     collection: Address,
     chain: &str,
+    quantity: u64,
 ) -> serde_json::Value {
     serde_json::json!({
         "address": format!("{minter:?}"),
         "recipient": format!("{minter:?}"),
         "fromAssets": [{ "asset": { "chain": chain, "contractAddress": NATIVE_TOKEN } }],
-        "toAssets": [{ "asset": { "chain": chain, "contractAddress": format!("{collection:?}") } }],
+        "toAssets": [{
+            "asset": { "chain": chain, "contractAddress": format!("{collection:?}") },
+            "quantity": quantity.to_string(),
+        }],
     })
 }
 
@@ -731,14 +738,29 @@ mod tests {
                 .unwrap(),
             SUSHI.parse().unwrap(),
             "robinhood",
+            3,
         );
         assert_eq!(v["fromAssets"][0]["asset"]["contractAddress"], NATIVE_TOKEN);
         assert_eq!(v["toAssets"][0]["asset"]["contractAddress"], SUSHI);
         assert_eq!(v["fromAssets"][0]["asset"]["chain"], "robinhood");
-        // Quantity is theirs to work out. Sending one would be telling them what
-        // the mint costs when the point is to be told.
-        assert!(v["fromAssets"][0].get("quantity").is_none());
         assert_eq!(v["address"], v["recipient"]);
+    }
+
+    // Measured against the live service: omitting the quantity returns valid
+    // calldata whose quantity word is zero and whose value is zero. That is a
+    // transaction which succeeds and mints nothing, which is the worst kind of
+    // wrong, so a quantity is always sent.
+    #[test]
+    fn it_always_asks_for_a_quantity_because_omitting_it_mints_nothing() {
+        let v = mint_action_variables(
+            "0x00000000000000000000000000000000000000aa"
+                .parse()
+                .unwrap(),
+            SUSHI.parse().unwrap(),
+            "robinhood",
+            2,
+        );
+        assert_eq!(v["toAssets"][0]["quantity"], "2");
     }
 
     #[test]
@@ -843,7 +865,7 @@ mod tests {
         let body = post(
             &http,
             MINT_ACTION,
-            mint_action_variables(minter, SUSHI.parse().unwrap(), "robinhood"),
+            mint_action_variables(minter, SUSHI.parse().unwrap(), "robinhood", 1),
             None,
         )
         .await

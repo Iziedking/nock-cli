@@ -1,7 +1,7 @@
 use alloy_primitives::Address;
 
 use crate::chain::seadrop::{
-    decode_mint_signed, SeaDropError, SignedMintCall, ValidationParams, SEADROP,
+    decode_mint_public, decode_mint_signed, SeaDropError, SignedMintCall, ValidationParams, SEADROP,
 };
 
 /// What makes an untrusted supplier acceptable on a money path.
@@ -45,6 +45,13 @@ pub struct Expectation {
     pub bounds: Option<ValidationParams>,
     /// What is left of `--max-spend` for the whole run.
     pub spend_remaining_wei: u128,
+    /// Which stage this run is entering.
+    ///
+    /// Checked against the selector rather than inferred from it. A signed stage
+    /// that hands back `mintPublic` calldata would mint the public phase by
+    /// accident: the transaction would succeed, at the public price, into a
+    /// stage the wallet may not even have wanted.
+    pub stage_is_signed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,6 +162,45 @@ impl std::fmt::Display for Rejection {
     }
 }
 
+/// Reads the calldata with the decoder the stage calls for.
+///
+/// The selector has to match the stage we meant to enter, not merely be one we
+/// recognise. Public calldata for a signed stage is a real mint at a different
+/// price into a phase the wallet may never have wanted, so the two are never
+/// interchangeable.
+fn decode_for(
+    submission: &SubmissionData,
+    expect: &Expectation,
+) -> Result<SignedMintCall, Rejection> {
+    if expect.stage_is_signed {
+        return decode_mint_signed(&submission.data)
+            .map_err(|e: SeaDropError| Rejection::Decode(e.to_string()));
+    }
+    {
+        let public = decode_mint_public(&submission.data)
+            .map_err(|e: SeaDropError| Rejection::Decode(e.to_string()))?;
+        // Widened into one shape so a single table checks both. A public stage
+        // carries no signed parameters, and the bounds checks below are skipped
+        // for it rather than run against these zeros.
+        Ok(SignedMintCall {
+            nft_contract: public.nft_contract,
+            fee_recipient: public.fee_recipient,
+            minter: public.minter,
+            quantity: public.quantity,
+            mint_price_wei: expect.unit_price_wei,
+            max_total_mintable_by_wallet: 0,
+            start_time: 0,
+            end_time: 0,
+            drop_stage_index: 0,
+            max_token_supply_for_stage: 0,
+            fee_bps: 0,
+            restrict_fee_recipients: false,
+            salt: [0u8; 32],
+            signature: Vec::new(),
+        })
+    }
+}
+
 /// Checks a submission against everything already known, and returns the decoded
 /// call only if all of it holds.
 ///
@@ -176,8 +222,7 @@ pub fn verify(
 
     // Refuses anything that is not a mintSigned selector, before any field of it
     // is believed.
-    let call = decode_mint_signed(&submission.data)
-        .map_err(|e: SeaDropError| Rejection::Decode(e.to_string()))?;
+    let call = decode_for(submission, expect)?;
 
     if call.nft_contract != expect.collection {
         return Err(Rejection::Collection {
@@ -187,7 +232,10 @@ pub fn verify(
     }
     // The field that decides who ends up owning the token. Everything else here
     // is money; this one is the whole purpose of the tool.
-    if call.minter != expect.minter {
+    // Zero means "the payer is the minter", which our own calldata builder uses
+    // and SeaDrop honours. OpenSea fills the wallet in explicitly. Both mint to
+    // the same address, so both pass and anything else does not.
+    if call.minter != expect.minter && call.minter != Address::ZERO {
         return Err(Rejection::Minter {
             expected: expect.minter,
             got: call.minter,
@@ -232,7 +280,10 @@ pub fn verify(
     // The on-chain anchor. These are the terms the collection itself published
     // for what its signer may sign within, so a response asking for anything
     // outside them was not authorised by the collection whatever it claims.
-    if let Some(bounds) = expect.bounds {
+    // Only a signed call carries a window and a fee to check. A public one has
+    // no signed parameters, so checking zeros against published bounds would
+    // refuse every public mint for failing a test it was never part of.
+    if let (Some(bounds), true) = (expect.bounds, expect.stage_is_signed) {
         if call.mint_price_wei < bounds.min_mint_price_wei {
             return Err(Rejection::PriceBelowFloor {
                 floor_wei: bounds.min_mint_price_wei,
@@ -372,6 +423,7 @@ mod tests {
                 allowed_fee_recipients: vec![FEE.parse().unwrap()],
                 bounds: Some(bounds()),
                 spend_remaining_wei: u128::MAX,
+                stage_is_signed: true,
             },
         )
     }
@@ -382,6 +434,76 @@ mod tests {
         let call = verify(&s, &e).unwrap();
         assert_eq!(call.quantity, QUANTITY);
         assert_eq!(call.mint_price_wei, PRICE);
+    }
+
+    // The exact calldata OpenSea returned for a live public stage on
+    // 2026-08-19, attribution bytes and all.
+    const REAL_PUBLIC: &str = "161ac21f000000000000000000000000941c2a17c60ad6daf86cb6438074d57e906adffa0000000000000000000000000000a26b00c1f0df003000390027140000faa7190000000000000000000000007bd7ec70346f762b8a6296b45eaec65af874aa4b00000000000000000000000000000000000000000000000000000000000000013d958fe2";
+
+    fn real_public() -> (SubmissionData, Expectation) {
+        (
+            SubmissionData {
+                to: SEADROP.parse().unwrap(),
+                data: hex::decode(REAL_PUBLIC).unwrap(),
+                value_wei: 300_000_000_000_000,
+            },
+            Expectation {
+                collection: COLLECTION.parse().unwrap(),
+                minter: "0x7bd7ec70346f762b8a6296b45eaec65af874aa4b"
+                    .parse()
+                    .unwrap(),
+                quantity: 1,
+                unit_price_wei: 300_000_000_000_000,
+                allowed_fee_recipients: vec![FEE.parse().unwrap()],
+                bounds: Some(bounds()),
+                spend_remaining_wei: u128::MAX,
+                stage_is_signed: false,
+            },
+        )
+    }
+
+    // The first calldata this code ever saw that we did not write ourselves.
+    #[test]
+    fn it_accepts_real_public_calldata_from_opensea() {
+        let (s, e) = real_public();
+        let call = verify(&s, &e).unwrap();
+        assert_eq!(call.quantity, 1);
+    }
+
+    // A signed stage handed public calldata would mint the public phase by
+    // accident: a real transaction, at a different price, into a stage the
+    // wallet may never have wanted.
+    #[test]
+    fn it_refuses_public_calldata_for_a_signed_stage() {
+        let (s, mut e) = real_public();
+        e.stage_is_signed = true;
+        assert!(matches!(verify(&s, &e), Err(Rejection::Decode(_))));
+    }
+
+    #[test]
+    fn it_refuses_signed_calldata_for_a_public_stage() {
+        let (s, mut e) = good();
+        e.stage_is_signed = false;
+        assert!(matches!(verify(&s, &e), Err(Rejection::Decode(_))));
+    }
+
+    // Our own builder leaves the minter word zero, meaning "the payer mints for
+    // itself", and SeaDrop honours that. Both forms must pass.
+    #[test]
+    fn it_accepts_a_zero_minter_word_as_the_payer_minting_for_itself() {
+        let (mut s, e) = real_public();
+        for byte in s.data[4 + 2 * 32..4 + 3 * 32].iter_mut() {
+            *byte = 0;
+        }
+        assert!(verify(&s, &e).is_ok());
+    }
+
+    #[test]
+    fn it_still_refuses_a_minter_that_is_somebody_else_entirely() {
+        let (mut s, e) = real_public();
+        s.data[4 + 3 * 32 - 1] = 0;
+        s.data[4 + 2 * 32 + 31] = 0xee;
+        assert!(matches!(verify(&s, &e), Err(Rejection::Minter { .. })));
     }
 
     #[test]

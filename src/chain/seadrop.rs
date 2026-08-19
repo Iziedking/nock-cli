@@ -180,6 +180,55 @@ const GET_VALIDATION_PARAMS: [u8; 4] = [0x81, 0xbf, 0x9a, 0xf3];
 /// `getSigners(address)`, confirmed 2026-08-19.
 const GET_SIGNERS: [u8; 4] = [0x7e, 0x3b, 0xa6, 0xaf];
 
+/// A `mintPublic` call, read back out of its calldata.
+///
+/// Four words and no struct, which is the whole difference from a signed mint:
+/// a public stage has nothing to authorise, so there is nothing to sign and
+/// nothing to verify a signature against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct PublicMintCall {
+    pub nft_contract: Address,
+    pub fee_recipient: Address,
+    /// Zero when the payer mints for itself. `OpenSea` fills this in explicitly
+    /// with the connected wallet; our own builder leaves it zero. Both mint to
+    /// the same address, so both are accepted and checked against the wallet.
+    pub minter: Address,
+    pub quantity: u64,
+}
+
+/// Reads a `mintPublic` call apart so every field can be checked.
+///
+/// Tolerates trailing bytes. `OpenSea` appends four of them, `3d958fe2`,
+/// measured on a real response 2026-08-19: an attribution tag that rides along
+/// after the last ABI word. Refusing calldata for having it would refuse every
+/// mint they build.
+#[allow(dead_code)]
+pub fn decode_mint_public(data: &[u8]) -> Result<PublicMintCall, SeaDropError> {
+    let short = || SeaDropError::Truncated {
+        len: data.len(),
+        call: "mintPublic",
+    };
+    let selector = data.get(0..4).ok_or_else(short)?;
+    if selector != MINT_PUBLIC {
+        return Err(SeaDropError::WrongSelector {
+            expected: hex::encode(MINT_PUBLIC),
+            got: hex::encode(selector),
+        });
+    }
+    let body = &data[4..];
+    let w = |i: usize| word_at(body, i).ok_or_else(short);
+    let address =
+        |i: usize| -> Result<Address, SeaDropError> { Ok(Address::from_slice(&w(i)?[12..32])) };
+
+    Ok(PublicMintCall {
+        nft_contract: address(0)?,
+        fee_recipient: address(1)?,
+        minter: address(2)?,
+        quantity: be_u64(w(3)?),
+    })
+}
+
 /// The bounds a collection published for what its signer may sign within.
 ///
 /// This is the independent anchor under the whole signed-stage path. `OpenSea` is
@@ -475,6 +524,49 @@ mod tests {
         );
         assert!(matches!(
             decode_mint_signed(&data),
+            Err(SeaDropError::WrongSelector { .. })
+        ));
+    }
+
+    // The exact calldata OpenSea returned for sushicatart on 2026-08-19, four
+    // attribution bytes and all. Real bytes, not bytes we built.
+    const REAL_MINT_PUBLIC: &str = "161ac21f000000000000000000000000941c2a17c60ad6daf86cb6438074d57e906adffa0000000000000000000000000000a26b00c1f0df003000390027140000faa7190000000000000000000000007bd7ec70346f762b8a6296b45eaec65af874aa4b00000000000000000000000000000000000000000000000000000000000000013d958fe2";
+
+    #[test]
+    fn it_reads_a_real_mint_public_call_from_opensea() {
+        let data = hex::decode(REAL_MINT_PUBLIC).unwrap();
+        let call = decode_mint_public(&data).unwrap();
+        assert_eq!(
+            format!("{:?}", call.nft_contract).to_lowercase(),
+            "0x941c2a17c60ad6daf86cb6438074d57e906adffa"
+        );
+        assert_eq!(
+            format!("{:?}", call.minter).to_lowercase(),
+            "0x7bd7ec70346f762b8a6296b45eaec65af874aa4b"
+        );
+        assert_eq!(call.quantity, 1);
+    }
+
+    // Four bytes ride along after the last word. Refusing them would refuse
+    // every mint OpenSea builds.
+    #[test]
+    fn it_tolerates_the_attribution_bytes_opensea_appends() {
+        let data = hex::decode(REAL_MINT_PUBLIC).unwrap();
+        assert_eq!(
+            data.len(),
+            4 + 4 * 32 + 4,
+            "selector, four words, four extra"
+        );
+        assert!(decode_mint_public(&data).is_ok());
+    }
+
+    #[test]
+    fn it_refuses_a_public_call_that_is_really_a_signed_one() {
+        let data = hex::decode(REAL_MINT_PUBLIC).unwrap();
+        let mut signed = data.clone();
+        signed[0..4].copy_from_slice(&MINT_SIGNED);
+        assert!(matches!(
+            decode_mint_public(&signed),
             Err(SeaDropError::WrongSelector { .. })
         ));
     }
