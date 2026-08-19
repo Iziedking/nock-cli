@@ -13,3 +13,4 @@
 #![allow(dead_code)]
 
 pub mod siwe;
+pub mod verify;
