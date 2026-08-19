@@ -7,6 +7,7 @@ mod chain;
 mod commands;
 mod config;
 mod engine;
+mod plan;
 mod wallet;
 
 use std::path::PathBuf;
@@ -49,6 +50,10 @@ enum Command {
         /// Actually send it. Without this nothing is broadcast.
         #[arg(long)]
         fire: bool,
+        /// The most this run may spend on mint prices, in ETH, for example
+        /// 0.05. Required when the stage is not free.
+        #[arg(long, value_name = "ETH")]
+        max_spend: Option<String>,
     },
     /// Create and inspect the encrypted wallet this machine mints with.
     Wallets {
@@ -96,11 +101,25 @@ async fn main() -> std::process::ExitCode {
             quantity,
             wallet,
             fire,
+            max_spend,
         } => {
+            let max_spend_wei = match max_spend.as_deref().map(plan::spend::parse_eth) {
+                Some(Ok(wei)) => Some(wei),
+                Some(Err(message)) => {
+                    eprintln!(
+                        "
+  --max-spend: {message}
+"
+                    );
+                    return std::process::ExitCode::FAILURE;
+                }
+                None => None,
+            };
             commands::mint::run(
                 &config,
                 commands::mint::MintArgs {
                     collection: &collection,
+                    max_spend_wei,
                     quantity,
                     wallet: &wallet.unwrap_or_else(commands::wallets::default_path),
                     fire,

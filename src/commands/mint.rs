@@ -15,6 +15,7 @@ use crate::commands::doctor::format_eth;
 use crate::config::Config;
 use crate::engine::clock::Clock;
 use crate::engine::confirm::{classify, ChainProbe, ConfirmSettings, Outcome};
+use crate::plan::spend::SpendCeiling;
 use crate::wallet::keystore::Keystore;
 
 /// Observed on chain: about 102,000 for one `mintPublic`. Rounded up, because a
@@ -34,6 +35,10 @@ pub struct MintArgs<'a> {
     /// Without this nothing is sent. A command that spends money should not do
     /// so because somebody pressed up-arrow and enter.
     pub fire: bool,
+    /// The most this whole run may spend on mint prices, in wei. Required once
+    /// any stage costs anything; --fire alone stops being enough authorisation
+    /// when there is a number that can move.
+    pub max_spend_wei: Option<u128>,
 }
 
 pub async fn run(config: &Config, args: MintArgs<'_>) -> ExitCode {
@@ -44,6 +49,35 @@ pub async fn run(config: &Config, args: MintArgs<'_>) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// What this mint will cost, once the user has said it may.
+///
+/// A price is a number to authorise, not a reason to refuse. --max-spend is
+/// required rather than defaulted, because the only safe default for "how much
+/// of your money may this spend" is one the user typed themselves. A free stage
+/// needs no ceiling and is never asked for one.
+fn authorise_price(
+    drop: &PublicDrop,
+    quantity: u64,
+    max_spend_wei: Option<u128>,
+) -> Result<u128, String> {
+    let total_price_wei = drop.mint_price_wei.saturating_mul(u128::from(quantity));
+    if drop.is_free() {
+        return Ok(0);
+    }
+    let Some(limit_wei) = max_spend_wei else {
+        return Err(format!(
+            "This stage costs {} ETH each, {} ETH for {}. Re-run with --max-spend to say what this run may spend.",
+            format_eth(drop.mint_price_wei),
+            format_eth(total_price_wei),
+            quantity
+        ));
+    };
+    SpendCeiling::new(limit_wei)
+        .commit(total_price_wei)
+        .map_err(|e| e.to_string())?;
+    Ok(total_price_wei)
 }
 
 async fn prepare_and_run(config: &Config, args: MintArgs<'_>) -> Result<ExitCode, String> {
@@ -66,12 +100,7 @@ async fn prepare_and_run(config: &Config, args: MintArgs<'_>) -> Result<ExitCode
         .await
         .map_err(|e| format!("could not read the fee recipient: {e}"))?;
 
-    if !drop.is_free() {
-        return Err(format!(
-            "This stage costs {} ETH per mint. Paid mints are not built yet.",
-            format_eth(drop.mint_price_wei)
-        ));
-    }
+    let total_price_wei = authorise_price(&drop, args.quantity, args.max_spend_wei)?;
     if args.quantity == 0 || args.quantity > u64::from(drop.max_per_wallet) {
         return Err(format!(
             "This stage allows {} per wallet and you asked for {}.",
@@ -112,7 +141,7 @@ async fn prepare_and_run(config: &Config, args: MintArgs<'_>) -> Result<ExitCode
         to: SEADROP
             .parse()
             .map_err(|_| "bad SeaDrop address".to_owned())?,
-        value: 0,
+        value: total_price_wei,
         data: mint_public_calldata(collection, fee, args.quantity),
     };
 
@@ -137,14 +166,20 @@ async fn prepare_and_run(config: &Config, args: MintArgs<'_>) -> Result<ExitCode
         args.quantity,
     );
 
-    let funded = balance >= worst_case;
+    // Gas alone was the old question because the price was always zero. The
+    // wallet has to cover both now, and the message says which part is which so
+    // somebody topping up knows how much to send.
+    let needed = worst_case.saturating_add(total_price_wei);
+    let funded = balance >= needed;
 
     if !args.fire {
         if !funded {
             println!(
-                "  NOT FUNDED. This holds {} ETH and the mint could cost up to {} ETH in gas.",
+                "  NOT FUNDED. This holds {} ETH. Needs {} ETH of price plus up to {} ETH of gas, {} ETH in all.",
                 format_eth(balance),
-                format_eth(worst_case)
+                format_eth(total_price_wei),
+                format_eth(worst_case),
+                format_eth(needed)
             );
             println!("  Send some to {from} before firing.\n");
         }
@@ -160,10 +195,11 @@ async fn prepare_and_run(config: &Config, args: MintArgs<'_>) -> Result<ExitCode
     // run should say everything it found, not stop at the first problem.
     if !funded {
         return Err(format!(
-            "Refusing to fire. This wallet holds {} ETH and the mint could cost up to {} ETH \
-             in gas. Send some to {from} first.",
+            "Refusing to fire. This wallet holds {} ETH. The mint needs {} ETH of price plus up to {} ETH of gas, {} ETH in all. Send some to {from} first.",
             format_eth(balance),
-            format_eth(worst_case)
+            format_eth(total_price_wei),
+            format_eth(worst_case),
+            format_eth(needed)
         ));
     }
 
@@ -312,7 +348,18 @@ fn report(
         "  stage        opens at unix {opens}, {} per wallet",
         drop.max_per_wallet
     );
-    println!("  price        free");
+    println!(
+        "  price        {}",
+        if drop.is_free() {
+            "free".to_owned()
+        } else {
+            format!(
+                "{} ETH each, {} ETH total",
+                format_eth(drop.mint_price_wei),
+                format_eth(drop.mint_price_wei.saturating_mul(u128::from(quantity)))
+            )
+        }
+    );
     println!("  fee to       {fee}");
     println!("  minting to   {from}   <- your wallet is the minter");
     println!("  quantity     {quantity}");
