@@ -33,6 +33,9 @@ fn detail(status: &PlanStatus) -> String {
     match status {
         PlanStatus::Ready { .. } => "ready".to_owned(),
         PlanStatus::NotEligible => "not eligible for this stage".to_owned(),
+        PlanStatus::SoldOut { left, wanted } => {
+            format!("sold out: {left} left and {wanted} wanted")
+        }
         // Named field, both values. "Refused" alone sends somebody to read our
         // source at T-2 minutes.
         PlanStatus::Refused(why) => format!("refused: {why}"),

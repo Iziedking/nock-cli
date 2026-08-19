@@ -60,6 +60,7 @@ impl PublicDrop {
         unix_seconds >= self.start_time && unix_seconds < self.end_time
     }
     #[must_use]
+    #[allow(dead_code)]
     pub const fn is_free(&self) -> bool {
         self.mint_price_wei == 0
     }
@@ -179,6 +180,46 @@ pub const MINT_SIGNED: [u8; 4] = [0x4b, 0x61, 0xcd, 0x6f];
 const GET_VALIDATION_PARAMS: [u8; 4] = [0x81, 0xbf, 0x9a, 0xf3];
 /// `getSigners(address)`, confirmed 2026-08-19.
 const GET_SIGNERS: [u8; 4] = [0x7e, 0x3b, 0xa6, 0xaf];
+
+/// `totalSupply()` and `maxSupply()` on the collection itself.
+const TOTAL_SUPPLY: [u8; 4] = [0x18, 0x16, 0x0d, 0xdd];
+const MAX_SUPPLY: [u8; 4] = [0xd5, 0xab, 0xeb, 0x01];
+
+/// How much of a collection is left.
+///
+/// Read before anything is signed, because `SeaDrop` reverts a mint past the
+/// supply with `MintQuantityExceedsMaxSupply` and a revert costs the gas of a
+/// transaction that was never going to work. Measured 2026-08-19: a live stage
+/// that looked open was already 888 of 888 gone, and the only way to find out
+/// was to pay for it.
+///
+/// `None` when either getter is missing, which some collections do not
+/// implement. Missing evidence is not a reason to refuse a mint.
+#[allow(dead_code)]
+pub async fn supply_left(rpc: &mut Rpc, collection: Address) -> Option<u64> {
+    let read = |data: [u8; 4]| format!("0x{}", hex::encode(data));
+    let total: String = rpc
+        .call(
+            "eth_call",
+            json!([{ "to": format!("{collection:?}"), "data": read(TOTAL_SUPPLY) }, "latest"]),
+        )
+        .await
+        .ok()?;
+    let max: String = rpc
+        .call(
+            "eth_call",
+            json!([{ "to": format!("{collection:?}"), "data": read(MAX_SUPPLY) }, "latest"]),
+        )
+        .await
+        .ok()?;
+
+    let word = |raw: &str| -> Option<u64> {
+        let bytes = hex::decode(raw.trim_start_matches("0x")).ok()?;
+        Some(be_u64(word_at(&bytes, 0)?))
+    };
+    let (total, max) = (word(&total)?, word(&max)?);
+    Some(max.saturating_sub(total))
+}
 
 /// A `mintPublic` call, read back out of its calldata.
 ///

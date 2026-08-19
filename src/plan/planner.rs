@@ -21,6 +21,9 @@ pub enum PlanStatus {
     Ready { quantity: u64, cost_wei: u128 },
     /// The stage answered that this wallet is not on the list.
     NotEligible,
+    /// Nothing left to mint. `SeaDrop` reverts on this, and a revert costs the gas
+    /// of a transaction that was never going to work, so it is caught here.
+    SoldOut { left: u64, wanted: u64 },
     /// The calldata did not survive verification. Carries the reason so the
     /// report can name the field and both values.
     Refused(Rejection),
@@ -45,6 +48,7 @@ impl PlanStatus {
         match self {
             Self::Ready { .. } => "ready",
             Self::NotEligible => "not eligible",
+            Self::SoldOut { .. } => "sold out",
             Self::Refused(_) => "refused",
             Self::Underfunded { .. } => "underfunded",
             Self::DroppedForSpend { .. } => "dropped for spend",
@@ -98,6 +102,9 @@ pub struct Candidate {
     pub balance_wei: u128,
     /// The worst case gas for one send, so the funding check covers both halves.
     pub gas_ceiling_wei: u128,
+    /// How many tokens the collection has left, when it says. `None` means the
+    /// getters are missing, which is not a reason to refuse.
+    pub supply_left: Option<u64>,
 }
 
 /// Decides each wallet's fate, in set order, against a ceiling it draws down.
@@ -129,6 +136,16 @@ fn plan_one(stage: Stage, candidate: &Candidate, ceiling: &mut SpendCeiling) -> 
     }
     if !candidate.eligible {
         return PlanStatus::NotEligible;
+    }
+    // Before the money questions, because a sold-out collection makes them moot
+    // and paying gas to be told so is the avoidable version of this.
+    if let Some(left) = candidate.supply_left {
+        if left < candidate.quantity {
+            return PlanStatus::SoldOut {
+                left,
+                wanted: candidate.quantity,
+            };
+        }
     }
     if candidate.quantity == 0 {
         return PlanStatus::NotEligible;
@@ -190,6 +207,7 @@ mod tests {
             refusal: None,
             balance_wei: ETH,
             gas_ceiling_wei: GAS,
+            supply_left: None,
         }
     }
 
@@ -298,6 +316,30 @@ mod tests {
         let plan = build_plan(stage(0), &candidates, &mut SpendCeiling::new(0));
         assert_eq!(plan.ready().count(), 5);
         assert_eq!(plan.total_cost_wei(), 0);
+    }
+
+    // Measured on a live stage that looked open and was 888 of 888 gone. The
+    // only way to learn that was to pay for a reverted transaction.
+    #[test]
+    fn it_refuses_a_sold_out_collection_before_spending_gas_on_it() {
+        let mut candidates: Vec<_> = (0..2).map(candidate).collect();
+        candidates[0].supply_left = Some(0);
+        candidates[1].supply_left = Some(5);
+        let plan = build_plan(stage(0), &candidates, &mut SpendCeiling::new(0));
+        assert!(matches!(
+            plan.wallets[0].status,
+            PlanStatus::SoldOut { left: 0, wanted: 1 }
+        ));
+        assert!(plan.wallets[1].status.is_ready());
+    }
+
+    // A collection that does not publish its supply is not a collection to
+    // refuse. Missing evidence is not evidence.
+    #[test]
+    fn an_unknown_supply_does_not_stop_a_mint() {
+        let candidates: Vec<_> = (0..1).map(candidate).collect();
+        let plan = build_plan(stage(0), &candidates, &mut SpendCeiling::new(0));
+        assert!(plan.wallets[0].status.is_ready());
     }
 
     #[test]

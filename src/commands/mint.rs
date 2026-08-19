@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -6,39 +6,64 @@ use alloy_primitives::Address;
 use serde_json::json;
 use zeroize::Zeroizing;
 
+use crate::chain::opensea::gql::{
+    self, mint_action_variables, StageType, COLLECTION_METADATA, COLLECTION_SEARCH,
+    DROP_ELIGIBILITY, MINT_ACTION,
+};
+use crate::chain::opensea::siwe::{authenticate, Session};
+use crate::chain::opensea::verify::{verify, Expectation, Rejection};
 use crate::chain::rpc::{parse_hex_u128, parse_hex_u64, Rpc, RpcError};
 use crate::chain::seadrop::{
-    fee_recipient, mint_public_calldata, public_drop, PublicDrop, SEADROP,
+    fee_recipient, mint_public_calldata, public_drop, supply_left, PublicDrop, SEADROP,
 };
 use crate::chain::tx::{Eip1559, Signed};
 use crate::commands::doctor::format_eth;
+use crate::commands::report::{exit_code, render_outcome_table, render_plan_table, WalletOutcome};
 use crate::config::Config;
 use crate::engine::clock::Clock;
 use crate::engine::confirm::{classify, ChainProbe, ConfirmSettings, Outcome};
+use crate::engine::fire::{fire_all_with, Shot};
+use crate::plan::planner::{build_plan, Candidate, StagePlan};
 use crate::plan::spend::SpendCeiling;
-use crate::wallet::keystore::Keystore;
+use crate::plan::stage::Stage;
+use crate::wallet::set::{read_set_file, unlock, WalletEntry, WalletSet};
 
-/// Observed on chain: about 102,000 for one `mintPublic`. Rounded up, because a
-/// limit that is too tight fails the mint outright while one that is slightly
-/// loose costs nothing when the call succeeds.
+/// Minting, from a wallet set, on a public or a signed stage.
+///
+/// The orchestration and nothing else. Every decision it makes lives somewhere
+/// tested: what a stage is and when it moved in `plan::stage`, who is in it in
+/// `plan::planner`, whether calldata can be trusted in `chain::opensea::verify`,
+/// how the batch goes out in `engine::fire`, and what to say about it in
+/// `commands::report`.
+///
+/// WHERE OPENSEA IS AND IS NOT INVOLVED. A public stage is built entirely from
+/// chain data: the price, the window and the fee recipient are all readable, and
+/// the calldata is four words we assemble ourselves. A signed stage cannot be,
+/// because it needs a signature only `OpenSea` holds. So the third party sits on
+/// the money path exactly where it is unavoidable and nowhere else.
 const GAS_LIMIT: u64 = 320_000;
 
-/// Everything expensive is done before the stage opens. What remains at the
-/// moment of firing is one write per endpoint, so preparation finishing late is
-/// worth saying out loud.
+/// Preparation is done by here. After this the loop only waits and writes.
+const FREEZE_SECONDS: i64 = 30;
+
+/// Far enough out that waiting is worth saying out loud.
 const READY_BY_SECONDS: i64 = 30;
 
 pub struct MintArgs<'a> {
     pub collection: &'a str,
     pub quantity: u64,
-    pub wallet: &'a Path,
+    /// One wallet or a whole set. A single `--wallet` becomes a one-entry set so
+    /// there is only one path below this point.
+    pub wallets: Vec<PathBuf>,
     /// Without this nothing is sent. A command that spends money should not do
     /// so because somebody pressed up-arrow and enter.
     pub fire: bool,
     /// The most this whole run may spend on mint prices, in wei. Required once
-    /// any stage costs anything; --fire alone stops being enough authorisation
-    /// when there is a number that can move.
+    /// any stage costs anything.
     pub max_spend_wei: Option<u128>,
+    /// Which stage to enter. Without it the run takes the earliest one that has
+    /// not ended.
+    pub stage: Option<u64>,
 }
 
 pub async fn run(config: &Config, args: MintArgs<'_>) -> ExitCode {
@@ -51,326 +76,510 @@ pub async fn run(config: &Config, args: MintArgs<'_>) -> ExitCode {
     }
 }
 
-/// What this mint will cost, once the user has said it may.
-///
-/// A price is a number to authorise, not a reason to refuse. --max-spend is
-/// required rather than defaulted, because the only safe default for "how much
-/// of your money may this spend" is one the user typed themselves. A free stage
-/// needs no ceiling and is never asked for one.
-fn authorise_price(
-    drop: &PublicDrop,
-    quantity: u64,
-    max_spend_wei: Option<u128>,
-) -> Result<u128, String> {
-    let total_price_wei = drop.mint_price_wei.saturating_mul(u128::from(quantity));
-    if drop.is_free() {
-        return Ok(0);
-    }
-    let Some(limit_wei) = max_spend_wei else {
-        return Err(format!(
-            "This stage costs {} ETH each, {} ETH for {}. Re-run with --max-spend to say what this run may spend.",
-            format_eth(drop.mint_price_wei),
-            format_eth(total_price_wei),
-            quantity
-        ));
-    };
-    SpendCeiling::new(limit_wei)
-        .commit(total_price_wei)
-        .map_err(|e| e.to_string())?;
-    Ok(total_price_wei)
-}
-
 async fn prepare_and_run(config: &Config, args: MintArgs<'_>) -> Result<ExitCode, String> {
     let collection: Address = args.collection.trim().parse().map_err(|_| {
         format!(
-            "'{}' is not a contract address. This command wants the NFT contract; \
-             resolving a name or an OpenSea link is not built yet.",
+            "{} is not an address. It should be 0x and 40 hex characters.",
             args.collection
         )
     })?;
 
-    let mut rpc = Rpc::new(config.rpc_urls.clone(), Duration::from_secs(10));
+    let wallets = unlock_all(&args.wallets)?;
+    println!("\n  {} wallet(s) unlocked", wallets.entries.len());
 
-    // 1. The stage, read from the chain. Nothing about the mint comes from an
-    //    API, so nothing about the mint can be delayed by one.
-    let drop = public_drop(&mut rpc, collection)
-        .await
-        .map_err(|e| format!("could not read the stage: {e}"))?;
+    let mut rpc = Rpc::new(config.rpc_urls.clone(), Duration::from_secs(10));
+    let http = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 nock")
+        .build()
+        .map_err(|e| format!("could not build an HTTP client: {e}"))?;
+
+    let (stage, slug) = choose_stage(&mut rpc, &http, collection, args.stage).await?;
+    println!(
+        "  stage {} is {}, opening at unix {}",
+        stage.index,
+        if stage.is_signed() {
+            "signed"
+        } else {
+            "public"
+        },
+        stage.start_time
+    );
+
+    if stage.price_wei > 0 && args.max_spend_wei.is_none() {
+        return Err(format!(
+            "This stage costs {} ETH each. Re-run with --max-spend to say what this run may spend.",
+            format_eth(stage.price_wei)
+        ));
+    }
+    let mut ceiling = SpendCeiling::new(args.max_spend_wei.unwrap_or(0));
+
     let fee = fee_recipient(&mut rpc, collection)
         .await
         .map_err(|e| format!("could not read the fee recipient: {e}"))?;
 
-    let total_price_wei = authorise_price(&drop, args.quantity, args.max_spend_wei)?;
-    if args.quantity == 0 || args.quantity > u64::from(drop.max_per_wallet) {
-        return Err(format!(
-            "This stage allows {} per wallet and you asked for {}.",
-            drop.max_per_wallet, args.quantity
-        ));
+    // Everything each wallet needs, gathered before anything is signed.
+    let mut prepared = Vec::with_capacity(wallets.entries.len());
+    for entry in &wallets.entries {
+        prepared.push(
+            prepare_wallet(
+                &mut rpc,
+                &http,
+                PrepareInput {
+                    entry,
+                    collection,
+                    fee,
+                    stage,
+                    slug: slug.as_deref(),
+                    quantity: args.quantity,
+                },
+            )
+            .await,
+        );
     }
 
-    // 2. The wallet. Unlocked once, here, and the key is wiped when this scope
-    //    ends whatever happens after.
-    let store = Keystore::load(args.wallet).map_err(|e| {
-        format!(
-            "could not read the wallet at {}: {e}",
-            args.wallet.display()
-        )
-    })?;
-    let secret = unlock(&store)?;
-    let from: Address = store
-        .address()
-        .parse()
-        .map_err(|_| "the wallet holds an address that cannot be parsed".to_owned())?;
-
-    // 3. Nonce, gas and balance, fetched now rather than at T-0.
-    let (nonce, gas_price, balance) = chain_state(&mut rpc, from).await?;
-
-    // There is no priority auction on this chain: the sequencer is first come,
-    // first served, so a tip buys nothing and would only be a donation. The
-    // ceiling is doubled because the base fee can move between here and the
-    // open, and the difference is refunded when it does not.
-    let max_fee = gas_price.saturating_mul(2);
-    let worst_case = u128::from(GAS_LIMIT).saturating_mul(max_fee);
-
-    let tx = Eip1559 {
-        chain_id: config.chain_id,
-        nonce,
-        max_priority_fee_per_gas: 0,
-        max_fee_per_gas: max_fee,
-        gas_limit: GAS_LIMIT,
-        to: SEADROP
-            .parse()
-            .map_err(|_| "bad SeaDrop address".to_owned())?,
-        value: total_price_wei,
-        data: mint_public_calldata(collection, fee, args.quantity),
-    };
-
-    // 4. Signed before the wait, not after. At T-0 there must be nothing left to
-    //    compute.
-    let signed = tx
-        .sign(&secret)
-        .map_err(|e| format!("could not sign: {e}"))?;
-
-    let mut clock = Clock::new();
-    clock.sync().await;
-
-    report(
-        &drop,
-        collection,
-        fee,
-        from,
-        balance,
-        worst_case,
-        &signed,
-        &clock,
-        args.quantity,
-    );
-
-    // Gas alone was the old question because the price was always zero. The
-    // wallet has to cover both now, and the message says which part is which so
-    // somebody topping up knows how much to send.
-    let needed = worst_case.saturating_add(total_price_wei);
-    let funded = balance >= needed;
+    let candidates: Vec<Candidate> = prepared.iter().map(|p| p.candidate.clone()).collect();
+    let plan = build_plan(stage, &candidates, &mut ceiling);
+    println!("{}", render_plan_table(&plan, &ceiling));
 
     if !args.fire {
-        if !funded {
-            println!(
-                "  NOT FUNDED. This holds {} ETH. Needs {} ETH of price plus up to {} ETH of gas, {} ETH in all.",
-                format_eth(balance),
-                format_eth(total_price_wei),
-                format_eth(worst_case),
-                format_eth(needed)
-            );
-            println!("  Send some to {from} before firing.\n");
-        }
-        println!(
-            "  Nothing was sent. Add --fire to actually mint.\n\
-             \n  Run this again close to the open: the nonce and gas price above were read\n  \
-             now, and a stage can be reconfigured until the moment it starts.\n"
-        );
+        println!("  Nothing was sent. Re-run with --fire when you mean it.\n");
         return Ok(ExitCode::SUCCESS);
     }
-
-    // Only a hard refusal when something is actually about to be spent. A dry
-    // run should say everything it found, not stop at the first problem.
-    if !funded {
-        return Err(format!(
-            "Refusing to fire. This wallet holds {} ETH. The mint needs {} ETH of price plus up to {} ETH of gas, {} ETH in all. Send some to {from} first.",
-            format_eth(balance),
-            format_eth(total_price_wei),
-            format_eth(worst_case),
-            format_eth(needed)
-        ));
+    if plan.ready().count() == 0 {
+        return Err("no wallet is ready for this stage, so there is nothing to send.".to_owned());
     }
 
-    fire(config, &clock, &drop, &signed, nonce, from, rpc).await
+    fire_stage(config, rpc, &plan, &prepared).await
 }
 
-/// Waits for the open, sends, and reports what happened. Split from preparation
-/// because this half is the only part that can cost anything, and the boundary is
-/// where the decision to spend money actually sits.
-async fn fire(
-    config: &Config,
-    clock: &Clock,
-    drop: &PublicDrop,
-    signed: &Signed,
+struct Prepared {
+    candidate: Candidate,
+    /// What this wallet would send, if it sends anything.
+    calldata: Vec<u8>,
+    value_wei: u128,
     nonce: u64,
-    from: Address,
+    max_fee: u128,
+    secret: Zeroizing<[u8; 32]>,
+    address: Address,
+}
+
+struct PrepareInput<'a> {
+    entry: &'a WalletEntry,
+    collection: Address,
+    fee: Address,
+    stage: Stage,
+    slug: Option<&'a str>,
+    quantity: u64,
+}
+
+/// One wallet's nonce, balance, calldata and verdict.
+///
+/// Never returns an error: a wallet that cannot take part comes back with a
+/// reason on its candidate, because the report promises a line for everybody.
+async fn prepare_wallet(
+    rpc: &mut Rpc,
+    http: &reqwest::Client,
+    input: PrepareInput<'_>,
+) -> Prepared {
+    let address = input.entry.address;
+    let (nonce, gas_price, balance) = chain_state(rpc, address).await.unwrap_or((0, 0, 0));
+    let max_fee = gas_price.saturating_mul(2);
+    let gas_ceiling_wei = u128::from(GAS_LIMIT).saturating_mul(max_fee);
+    let quantity = input.quantity.min(input.stage.max_per_wallet.max(1));
+
+    let mut candidate = Candidate {
+        index: input.entry.index,
+        address,
+        eligible: true,
+        quantity,
+        refusal: None,
+        balance_wei: balance,
+        gas_ceiling_wei,
+        supply_left: supply_left(rpc, input.collection).await,
+    };
+
+    let (calldata, value_wei) = if input.stage.is_signed() {
+        match signed_calldata(http, &input, address, quantity).await {
+            Ok((data, value, refusal)) => {
+                candidate.refusal = refusal;
+                (data, value)
+            }
+            Err(why) => {
+                // Not eligible is the ordinary answer here, so it is reported as
+                // that rather than as a failure of ours.
+                candidate.eligible = false;
+                println!("  wallet {}: {why}", input.entry.index);
+                (Vec::new(), 0)
+            }
+        }
+    } else {
+        // Public stages need nothing from anybody: four words, from chain data.
+        (
+            mint_public_calldata(input.collection, input.fee, quantity),
+            input.stage.price_wei.saturating_mul(u128::from(quantity)),
+        )
+    };
+
+    if calldata.is_empty() {
+        candidate.eligible = false;
+    }
+
+    Prepared {
+        candidate,
+        calldata,
+        value_wei,
+        nonce,
+        max_fee,
+        secret: input.entry.secret.clone(),
+        address,
+    }
+}
+
+/// Calldata for a signed stage, which is the only thing `OpenSea` is asked for.
+///
+/// Returns the calldata, its value, and a refusal if verification found one. A
+/// refusal is not an error: the wallet stays in the report with the field named.
+async fn signed_calldata(
+    http: &reqwest::Client,
+    input: &PrepareInput<'_>,
+    address: Address,
+    quantity: u64,
+) -> Result<(Vec<u8>, u128, Option<Rejection>), String> {
+    let slug = input.slug.ok_or_else(|| {
+        "this collection is not on OpenSea, so a signed stage cannot be minted here".to_owned()
+    })?;
+
+    let session: Session = authenticate(http, address, &input.entry.secret, 4663)
+        .await
+        .map_err(|e| format!("could not sign in to OpenSea: {e}"))?;
+
+    let body = gql::post(
+        http,
+        DROP_ELIGIBILITY,
+        json!({ "collectionSlug": slug, "address": format!("{address:?}") }),
+        Some(&session),
+    )
+    .await
+    .map_err(|e| format!("could not read eligibility: {e}"))?;
+
+    let eligibility =
+        gql::parse_eligibility(&body).map_err(|e| format!("could not read eligibility: {e}"))?;
+    let mine = eligibility
+        .iter()
+        .find(|e| e.stage_index == input.stage.index)
+        .ok_or_else(|| {
+            format!(
+                "stage {} was not in the eligibility answer",
+                input.stage.index
+            )
+        })?;
+    if !mine.is_eligible {
+        return Err(format!("not on the list for stage {}", input.stage.index));
+    }
+
+    let body = gql::post(
+        http,
+        MINT_ACTION,
+        mint_action_variables(address, input.collection, "robinhood", quantity),
+        Some(&session),
+    )
+    .await
+    .map_err(|e| format!("could not fetch calldata: {e}"))?;
+    let submission =
+        gql::parse_submission(&body).map_err(|e| format!("could not fetch calldata: {e}"))?;
+
+    // Nothing reaches the signer until this passes.
+    let expectation = Expectation {
+        collection: input.collection,
+        minter: address,
+        quantity,
+        unit_price_wei: input.stage.price_wei,
+        allowed_fee_recipients: vec![input.fee],
+        bounds: None,
+        spend_remaining_wei: u128::MAX,
+        stage_is_signed: true,
+    };
+    match verify(&submission, &expectation) {
+        Ok(_) => Ok((submission.data, submission.value_wei, None)),
+        Err(refusal) => Ok((Vec::new(), 0, Some(refusal))),
+    }
+}
+
+/// Waits for the open and sends every ready wallet at once.
+async fn fire_stage(
+    config: &Config,
     rpc: Rpc,
+    plan: &StagePlan,
+    prepared: &[Prepared],
 ) -> Result<ExitCode, String> {
-    let open_at_ms = i64::try_from(drop.start_time).unwrap_or(0) * 1_000;
+    let clock = Clock::new();
+    let open_at_ms = i64::try_from(plan.stage.start_time).unwrap_or(0) * 1_000;
     let remaining = open_at_ms - clock.now_ms();
 
-    // Drift only matters when there is a moment to hit. For a stage that is
-    // already open there is nothing to be early or late for, so a loose clock is
-    // worth reporting and not worth refusing over. Insisting here would block a
-    // mint that cannot possibly be mistimed.
     if remaining > 0 {
         clock
             .assert_usable()
             .map_err(|e| format!("refusing to fire at a stage that has not opened: {e}"))?;
-    } else if clock.assert_usable().is_err() {
-        println!(
-            "  Clock is {} ms out, which does not matter here: the stage is already open.
-",
-            clock.drift_ms()
-        );
+        if remaining > READY_BY_SECONDS * 1_000 {
+            println!(
+                "  Waiting {} seconds for the stage to open.",
+                remaining / 1_000
+            );
+        } else {
+            println!("  Opens in {remaining} ms.");
+        }
     }
-    if remaining > READY_BY_SECONDS * 1_000 {
-        println!(
-            "  Waiting {} seconds for the stage to open.\n",
-            remaining / 1_000
-        );
-    } else if remaining > 0 {
-        println!("  Opens in {remaining} ms.\n");
+
+    // Signed before the wait, so at T-0 there is nothing left to compute.
+    let mut shots = Vec::new();
+    for prep in prepared {
+        if !plan
+            .wallets
+            .iter()
+            .any(|w| w.index == prep.candidate.index && w.status.is_ready())
+        {
+            continue;
+        }
+        let tx = Eip1559 {
+            chain_id: config.chain_id,
+            nonce: prep.nonce,
+            max_priority_fee_per_gas: 0,
+            max_fee_per_gas: prep.max_fee,
+            gas_limit: GAS_LIMIT,
+            to: SEADROP
+                .parse()
+                .map_err(|_| "bad SeaDrop address".to_owned())?,
+            value: prep.value_wei,
+            data: prep.calldata.clone(),
+        };
+        let signed = tx
+            .sign(&prep.secret)
+            .map_err(|e| format!("could not sign for {}: {e}", prep.address))?;
+        shots.push(Shot {
+            index: prep.candidate.index,
+            address: prep.address,
+            nonce: prep.nonce,
+            signed,
+        });
+    }
+    println!("  {} transaction(s) signed and frozen\n", shots.len());
+
+    if remaining > 0 && remaining < FREEZE_SECONDS * 1_000 {
+        println!("  Inside the freeze window. Nothing further will be fetched or re-signed.");
     }
     clock.sleep_until(open_at_ms).await;
-
-    // Drift can appear during the wait, so it is checked again rather than
-    // trusted from before. Only when there was a wait to drift across.
     if remaining > 0 {
         clock
             .assert_usable()
             .map_err(|e| format!("refusing to fire, the clock moved during the wait: {e}"))?;
     }
 
-    let sent = send_everywhere(config, signed).await;
-    println!("  {}", sent.summary);
-    if !sent.accepted {
-        return Err(format!(
-            "no endpoint accepted the transaction. {}",
-            sent.summary
-        ));
+    // The closure owns its endpoints rather than borrowing the config, because
+    // each send runs on its own task and a borrow cannot outlive this function.
+    let send_urls: Vec<String> = config.send_urls();
+    let sent = fire_all_with(shots.clone(), move |shot: Shot| {
+        let send_urls = send_urls.clone();
+        async move {
+            let out = send_to(&send_urls, &shot.signed).await;
+            if out.accepted {
+                Ok(format!("{:?}", shot.signed.hash))
+            } else {
+                Err(out.summary)
+            }
+        }
+    })
+    .await;
+
+    // What actually happened, per wallet, from the chain rather than from the
+    // endpoint that took the bytes.
+    let mut results = Vec::with_capacity(sent.len());
+    for (result, shot) in sent.iter().zip(shots.iter()) {
+        let outcome = match &result.dispatch {
+            Err(reason) => Outcome::Rejected {
+                reason: reason.clone(),
+            },
+            Ok(hash) => {
+                let mut probe = RpcProbe {
+                    rpc: Rpc::new(config.rpc_urls.clone(), Duration::from_secs(10)),
+                    hash: hash.clone(),
+                    from: shot.address,
+                    signed: shot.signed.clone(),
+                    config,
+                };
+                classify(&mut probe, shot.nonce, ConfirmSettings::default()).await
+            }
+        };
+        results.push(WalletOutcome {
+            index: result.index,
+            address: result.address,
+            outcome,
+            tx_hash: result.dispatch.as_ref().ok().cloned(),
+        });
     }
 
-    // 6. What actually happened. Four states, and only one is a win.
-    // Everything below reports what happened; none of it decides it.
-    let mut probe = RpcProbe {
-        rpc,
-        hash: format!("{:?}", signed.hash),
-        from,
-        signed: signed.clone(),
-        config,
-    };
-    let outcome = classify(&mut probe, nonce, ConfirmSettings::default()).await;
-    println!("\n  {}", describe(&outcome, &format!("{:?}", signed.hash)));
-    println!();
+    drop(rpc);
+    println!("{}", render_outcome_table(&results));
+    Ok(exit_code(&results))
+}
 
-    Ok(if outcome.is_win() {
-        ExitCode::SUCCESS
+/// The stage to enter, and the `OpenSea` slug if the collection has one.
+///
+/// The chain is asked first and is enough on its own for a public stage. `OpenSea`
+/// is consulted for the stage list because signed stages are invisible from
+/// chain alone, and its absence is not fatal.
+async fn choose_stage(
+    rpc: &mut Rpc,
+    http: &reqwest::Client,
+    collection: Address,
+    wanted: Option<u64>,
+) -> Result<(Stage, Option<String>), String> {
+    let on_chain: Option<PublicDrop> = public_drop(rpc, collection).await.ok();
+
+    let mut slug = None;
+    let mut stages: Vec<Stage> = Vec::new();
+    if let Ok(body) = gql::post(
+        http,
+        COLLECTION_SEARCH,
+        json!({ "query": format!("{collection:?}") }),
+        None,
+    )
+    .await
+    {
+        if let Ok(found) = gql::parse_collection(&body, collection) {
+            if let Ok(meta) = gql::post(
+                http,
+                COLLECTION_METADATA,
+                json!({ "slug": found.slug }),
+                None,
+            )
+            .await
+            {
+                if let Ok(list) = gql::parse_metadata(&meta) {
+                    stages = list
+                        .iter()
+                        .map(|m| {
+                            let price = if m.stage_type == StageType::PublicSale {
+                                on_chain.map_or(0, |d| d.mint_price_wei)
+                            } else {
+                                // A signed stage's price is only knowable from the
+                                // calldata, which is verified before it is used.
+                                0
+                            };
+                            Stage::from_meta(m, price)
+                        })
+                        .collect();
+                }
+            }
+            slug = Some(found.slug);
+        }
+    }
+
+    if stages.is_empty() {
+        let drop = on_chain.ok_or_else(|| {
+            "no public stage on chain and nothing on OpenSea, so there is nothing to mint"
+                .to_owned()
+        })?;
+        stages.push(Stage {
+            index: 0,
+            kind: StageType::PublicSale,
+            start_time: drop.start_time,
+            end_time: drop.end_time,
+            price_wei: drop.mint_price_wei,
+            max_per_wallet: u64::from(drop.max_per_wallet),
+        });
+    }
+
+    let now = now_unix();
+    // The earliest stage that has not already ended, so a run started early
+    // walks into the first thing it can actually mint.
+    let chosen = if let Some(index) = wanted {
+        stages
+            .into_iter()
+            .find(|s| s.index == index)
+            .ok_or_else(|| format!("this drop has no stage {index}"))?
     } else {
-        ExitCode::FAILURE
-    })
+        {
+            let mut live: Vec<Stage> = stages.into_iter().filter(|s| s.end_time > now).collect();
+            live.sort_by_key(|s| s.start_time);
+            live.into_iter()
+                .next()
+                .ok_or_else(|| "every stage on this drop has ended".to_owned())?
+        }
+    };
+    Ok((chosen, slug))
 }
 
-/// Nonce, gas price and balance in one place, read during preparation so that
-/// nothing at T-0 is waiting on a round trip.
-async fn chain_state(rpc: &mut Rpc, from: Address) -> Result<(u64, u128, u128), String> {
-    let nonce = parse_hex_u64(
-        &rpc.call::<String>(
-            "eth_getTransactionCount",
-            json!([from.to_string(), "pending"]),
-        )
-        .await
-        .map_err(|e| format!("could not read the nonce: {e}"))?,
-    )
-    .map_err(|e| e.to_string())?;
-
-    let gas_price = parse_hex_u128(
-        &rpc.call::<String>("eth_gasPrice", json!([]))
-            .await
-            .map_err(|e| format!("could not read the gas price: {e}"))?,
-    )
-    .map_err(|e| e.to_string())?;
-
-    let balance = parse_hex_u128(
-        &rpc.call::<String>("eth_getBalance", json!([from.to_string(), "latest"]))
-            .await
-            .map_err(|e| format!("could not read the balance: {e}"))?,
-    )
-    .map_err(|e| e.to_string())?;
-
-    Ok((nonce, gas_price, balance))
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
-fn unlock(store: &Keystore) -> Result<Zeroizing<[u8; 32]>, String> {
+fn unlock_all(paths: &[PathBuf]) -> Result<WalletSet, String> {
+    if paths.is_empty() {
+        return Err("no wallet was given. Use --wallet or --wallet-set.".to_owned());
+    }
+    let passphrase = read_passphrase(paths.len())?;
+    unlock(paths, &passphrase).map_err(|e| e.to_string())
+}
+
+/// One prompt for the whole set. Asking once per wallet under time pressure is
+/// how people end up leaving keys unlocked somewhere convenient.
+fn read_passphrase(count: usize) -> Result<Zeroizing<String>, String> {
     use std::io::{BufRead, IsTerminal};
-    let passphrase = if std::io::stdin().is_terminal() {
-        rpassword::prompt_password(format!("Passphrase for {}: ", store.address()))
+    if std::io::stdin().is_terminal() {
+        rpassword::prompt_password(format!("Passphrase for {count} wallet(s): "))
             .map(Zeroizing::new)
-            .map_err(|_| "could not read the passphrase".to_owned())?
+            .map_err(|_| "could not read the passphrase".to_owned())
     } else {
         let mut line = Zeroizing::new(String::new());
         std::io::stdin()
             .lock()
             .read_line(&mut line)
             .map_err(|_| "could not read the passphrase".to_owned())?;
-        Zeroizing::new(line.trim_end().to_owned())
-    };
-    store.decrypt(&passphrase).map_err(|e| e.to_string())
+        Ok(Zeroizing::new(line.trim_end().to_owned()))
+    }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn report(
-    drop: &PublicDrop,
-    collection: Address,
-    fee: Address,
-    from: Address,
-    balance: u128,
-    worst_case: u128,
-    signed: &Signed,
-    clock: &Clock,
-    quantity: u64,
-) {
-    let opens = drop.start_time;
-    println!("\n  collection   {collection}");
-    println!(
-        "  stage        opens at unix {opens}, {} per wallet",
-        drop.max_per_wallet
-    );
-    println!(
-        "  price        {}",
-        if drop.is_free() {
-            "free".to_owned()
-        } else {
-            format!(
-                "{} ETH each, {} ETH total",
-                format_eth(drop.mint_price_wei),
-                format_eth(drop.mint_price_wei.saturating_mul(u128::from(quantity)))
-            )
+/// Reads the set file, or treats a single path as a set of one.
+pub fn wallet_paths(
+    single: Option<&PathBuf>,
+    set: Option<&PathBuf>,
+) -> Result<Vec<PathBuf>, String> {
+    match (single, set) {
+        (_, Some(file)) => {
+            let text = std::fs::read_to_string(file)
+                .map_err(|e| format!("could not read {}: {e}", file.display()))?;
+            let base = file.parent().unwrap_or_else(|| std::path::Path::new("."));
+            read_set_file(&text, base).map_err(|e| e.to_string())
         }
-    );
-    println!("  fee to       {fee}");
-    println!("  minting to   {from}   <- your wallet is the minter");
-    println!("  quantity     {quantity}");
-    println!("  balance      {} ETH", format_eth(balance));
-    println!("  gas ceiling  {} ETH", format_eth(worst_case));
-    println!("  tx hash      {:?}", signed.hash);
-    println!("  calldata     {} bytes", signed.raw.len());
-    match clock.assert_usable() {
-        Ok(()) => println!("  clock        {} ms drift\n", clock.drift_ms()),
-        Err(err) => println!("  clock        {err}\n"),
+        (Some(one), None) => Ok(vec![one.clone()]),
+        (None, None) => Err("no wallet was given. Use --wallet or --wallet-set.".to_owned()),
     }
+}
+
+async fn chain_state(rpc: &mut Rpc, from: Address) -> Result<(u64, u128, u128), String> {
+    let nonce: String = rpc
+        .call(
+            "eth_getTransactionCount",
+            json!([format!("{from:?}"), "pending"]),
+        )
+        .await
+        .map_err(|e| format!("could not read the nonce: {e}"))?;
+    let gas_price: String = rpc
+        .call("eth_gasPrice", json!([]))
+        .await
+        .map_err(|e| format!("could not read the gas price: {e}"))?;
+    let balance: String = rpc
+        .call("eth_getBalance", json!([format!("{from:?}"), "latest"]))
+        .await
+        .map_err(|e| format!("could not read the balance: {e}"))?;
+
+    Ok((
+        parse_hex_u64(&nonce).map_err(|e| e.to_string())?,
+        parse_hex_u128(&gas_price).map_err(|e| e.to_string())?,
+        parse_hex_u128(&balance).map_err(|e| e.to_string())?,
+    ))
 }
 
 struct Sent {
@@ -378,15 +587,16 @@ struct Sent {
     summary: String,
 }
 
-/// Pushes the same signed bytes to the sequencer and every read endpoint at
-/// once. The sequencer is the only one that orders anything; the others are
-/// additional ways in, not additional chances.
 async fn send_everywhere(config: &Config, signed: &Signed) -> Sent {
+    send_to(&config.send_urls(), signed).await
+}
+
+async fn send_to(urls: &[String], signed: &Signed) -> Sent {
     let raw = signed.raw_hex();
     let mut accepted = false;
     let mut notes = Vec::new();
 
-    for url in config.send_urls() {
+    for url in urls {
         let mut endpoint = Rpc::new(vec![url.clone()], Duration::from_secs(8));
         match endpoint
             .call::<String>("eth_sendRawTransaction", json!([raw]))
@@ -414,7 +624,7 @@ async fn send_everywhere(config: &Config, signed: &Signed) -> Sent {
     }
     Sent {
         accepted,
-        summary: notes.join("\n  "),
+        summary: notes.join("; "),
     }
 }
 
@@ -433,7 +643,7 @@ impl ChainProbe for RpcProbe<'_> {
             .call("eth_getTransactionReceipt", json!([self.hash]))
             .await
             .map_err(|_| ())?;
-        Ok(value.and_then(|v| v.get("status").and_then(|s| s.as_str().map(str::to_owned))))
+        Ok(value.and_then(|v| v.get("status").and_then(|s| s.as_str()).map(str::to_owned)))
     }
 
     async fn seen(&mut self) -> Result<bool, ()> {
@@ -446,39 +656,48 @@ impl ChainProbe for RpcProbe<'_> {
     }
 
     async fn nonce(&mut self) -> Result<u64, ()> {
-        let hex: String = self
+        let raw: String = self
             .rpc
             .call(
                 "eth_getTransactionCount",
-                json!([self.from.to_string(), "pending"]),
+                json!([format!("{:?}", self.from), "latest"]),
             )
             .await
             .map_err(|_| ())?;
-        parse_hex_u64(&hex).map_err(|_| ())
+        parse_hex_u64(&raw).map_err(|_| ())
     }
 
     async fn resend(&mut self) -> Result<(), ()> {
-        // The second ingress: the read endpoints reach the same sequencer by a
-        // different network path, which is the only thing that could differ.
-        let mut endpoint = Rpc::new(self.config.rpc_urls.clone(), Duration::from_secs(5));
-        let _ = endpoint
-            .call::<String>("eth_sendRawTransaction", json!([self.signed.raw_hex()]))
-            .await;
-        Ok(())
+        let out = send_everywhere(self.config, &self.signed).await;
+        if out.accepted {
+            Ok(())
+        } else {
+            Err(())
+        }
     }
 }
 
-fn describe(outcome: &Outcome, hash: &str) -> String {
-    match outcome {
-        Outcome::Included { reverted: false } => format!("MINTED. {hash}"),
-        Outcome::Included { reverted: true } => {
-            format!("It landed and reverted on chain, so nothing was minted. {hash}")
-        }
-        Outcome::Rejected { reason } => format!("Rejected. {reason}"),
-        Outcome::Vanished { reason } => format!("VANISHED. {reason}. {hash}"),
-        // Never described as a win. A dispatch is not an outcome.
-        Outcome::Dispatched { reason } => {
-            format!("No receipt yet, so this is not a win. {reason} {hash}")
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A single --wallet is a set of one, so nothing below the unlock has two
+    // code paths to keep in step.
+    #[test]
+    fn a_single_wallet_is_a_set_of_one() {
+        let one = PathBuf::from("a.json");
+        assert_eq!(wallet_paths(Some(&one), None).unwrap(), vec![one]);
+    }
+
+    #[test]
+    fn it_refuses_a_run_with_no_wallet_at_all() {
+        assert!(wallet_paths(None, None).is_err());
+    }
+
+    #[test]
+    fn it_reports_a_set_file_it_cannot_read_rather_than_running_empty() {
+        let missing = PathBuf::from("does-not-exist.txt");
+        let err = wallet_paths(None, Some(&missing)).unwrap_err();
+        assert!(err.contains("could not read"));
     }
 }

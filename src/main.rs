@@ -47,6 +47,14 @@ enum Command {
         quantity: u64,
         #[arg(long, short)]
         wallet: Option<PathBuf>,
+        /// A file of keystore paths, one per line, minted in that order.
+        /// The order decides who loses their place if a price rises.
+        #[arg(long, conflicts_with = "wallet")]
+        wallet_set: Option<PathBuf>,
+        /// Which stage to enter. Without it the run takes the earliest stage
+        /// that has not ended.
+        #[arg(long)]
+        stage: Option<u64>,
         /// Actually send it. Without this nothing is broadcast.
         #[arg(long)]
         fire: bool,
@@ -100,6 +108,8 @@ async fn main() -> std::process::ExitCode {
             collection,
             quantity,
             wallet,
+            wallet_set,
+            stage,
             fire,
             max_spend,
         } => {
@@ -115,13 +125,30 @@ async fn main() -> std::process::ExitCode {
                 }
                 None => None,
             };
+            let single = wallet.or_else(|| {
+                // Without either flag the run uses the machine's own wallet,
+                // which is what every single-wallet run did before sets existed.
+                wallet_set.is_none().then(commands::wallets::default_path)
+            });
+            let wallets = match commands::mint::wallet_paths(single.as_ref(), wallet_set.as_ref()) {
+                Ok(paths) => paths,
+                Err(message) => {
+                    eprintln!(
+                        "
+  {message}
+"
+                    );
+                    return std::process::ExitCode::FAILURE;
+                }
+            };
             commands::mint::run(
                 &config,
                 commands::mint::MintArgs {
                     collection: &collection,
                     max_spend_wei,
                     quantity,
-                    wallet: &wallet.unwrap_or_else(commands::wallets::default_path),
+                    wallets,
+                    stage,
                     fire,
                 },
             )
