@@ -100,6 +100,30 @@ query MintActionTimelineQuery(
 }
 ";
 
+/// The native token, which is what a mint is paid from.
+pub const NATIVE_TOKEN: &str = "0x0000000000000000000000000000000000000000";
+
+/// Variables for `MintActionTimelineQuery`.
+///
+/// Shape measured 2026-08-19 by asking the server what it required, one field at
+/// a time: `AssetQuantityInput` needs `asset: AssetIdentifier!`, which needs
+/// `chain` and `contractAddress`. The two sides must differ, so a mint is the
+/// native token in and the collection out. Quantity is omitted deliberately:
+/// supplying it means telling `OpenSea` what the mint costs, and the whole point
+/// is that they tell us.
+pub fn mint_action_variables(
+    minter: Address,
+    collection: Address,
+    chain: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "address": format!("{minter:?}"),
+        "recipient": format!("{minter:?}"),
+        "fromAssets": [{ "asset": { "chain": chain, "contractAddress": NATIVE_TOKEN } }],
+        "toAssets": [{ "asset": { "chain": chain, "contractAddress": format!("{collection:?}") } }],
+    })
+}
+
 #[derive(Debug, Error)]
 pub enum GqlError {
     #[error("could not reach OpenSea: {0}")]
@@ -108,7 +132,7 @@ pub enum GqlError {
     Status { status: u16 },
     #[error("OpenSea returned an error: {0}")]
     Query(String),
-    #[error("OpenSea's reply is missing {0}, which means the shape changed")]
+    #[error("the reply from OpenSea is missing {0}, which means the shape changed")]
     Missing(&'static str),
     #[error("OpenSea returned an unknown stage type: {0}")]
     UnknownStageType(String),
@@ -120,6 +144,11 @@ pub enum GqlError {
     NotFound(String),
     #[error("a wallet session is needed for this, and none was established")]
     SessionRequired,
+    // Not a schema problem: OpenSea understood the question and answered that
+    // this mint cannot happen. Kept as their own type name because that is more
+    // precise than any sentence we would write over it.
+    #[error("OpenSea will not build this mint: {0}")]
+    Refused(String),
 }
 
 /// The three stage kinds `OpenSea` names, and nothing invented.
@@ -293,6 +322,14 @@ struct SwapData {
 #[derive(Deserialize)]
 struct WireSwap {
     actions: Vec<WireAction>,
+    #[serde(default)]
+    errors: Vec<WireSwapError>,
+}
+
+#[derive(Deserialize)]
+struct WireSwapError {
+    #[serde(rename = "__typename")]
+    typename: String,
 }
 
 #[derive(Deserialize)]
@@ -436,6 +473,18 @@ pub fn parse_eligibility(json: &str) -> Result<Vec<Eligibility>, GqlError> {
 pub fn parse_submission(json: &str) -> Result<SubmissionData, GqlError> {
     let data: SwapData = envelope(json)?;
     let swap = data.swap.ok_or(GqlError::Missing("swap"))?;
+    // Errors here are answers, not failures of ours: InsufficientFundError,
+    // ineligibility, a closed stage. Reported before the missing-calldata check
+    // so the reason is the real one rather than "no calldata".
+    if !swap.errors.is_empty() {
+        return Err(GqlError::Refused(
+            swap.errors
+                .iter()
+                .map(|e| e.typename.clone())
+                .collect::<Vec<_>>()
+                .join(", "),
+        ));
+    }
     let submission = swap
         .actions
         .into_iter()
@@ -661,6 +710,37 @@ mod tests {
         ));
     }
 
+    // OpenSea answering "this mint cannot happen" is an answer, and saying
+    // "missing transactionSubmissionData" over the top of it would report our
+    // parser's disappointment instead of their reason.
+    #[test]
+    fn it_reports_why_opensea_would_not_build_the_mint() {
+        let json =
+            r#"{"data":{"swap":{"actions":[],"errors":[{"__typename":"InsufficientFundError"}]}}}"#;
+        match parse_submission(json) {
+            Err(GqlError::Refused(why)) => assert_eq!(why, "InsufficientFundError"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn it_builds_the_mint_variables_in_the_shape_the_server_requires() {
+        let v = mint_action_variables(
+            "0x00000000000000000000000000000000000000aa"
+                .parse()
+                .unwrap(),
+            SUSHI.parse().unwrap(),
+            "robinhood",
+        );
+        assert_eq!(v["fromAssets"][0]["asset"]["contractAddress"], NATIVE_TOKEN);
+        assert_eq!(v["toAssets"][0]["asset"]["contractAddress"], SUSHI);
+        assert_eq!(v["fromAssets"][0]["asset"]["chain"], "robinhood");
+        // Quantity is theirs to work out. Sending one would be telling them what
+        // the mint costs when the point is to be told.
+        assert!(v["fromAssets"][0].get("quantity").is_none());
+        assert_eq!(v["address"], v["recipient"]);
+    }
+
     #[test]
     fn it_surfaces_a_graphql_error_rather_than_an_empty_result() {
         let json = r#"{"errors":[{"message":"Cannot query field \"nope\""}]}"#;
@@ -744,5 +824,38 @@ mod tests {
         let eligibility = parse_eligibility(&body).unwrap();
         println!("{} stage(s) answered with a session", eligibility.len());
         assert!(!eligibility.is_empty());
+    }
+
+    // Proves the mint-action shape against the real service. An empty wallet
+    // cannot receive calldata, so the pass condition is a refusal with their own
+    // reason rather than a schema complaint: a wrong shape fails validation,
+    // and a right shape fails on funds.
+    #[tokio::test]
+    #[ignore]
+    async fn the_mint_action_query_is_understood_by_the_real_service() {
+        let http = reqwest::Client::builder()
+            .user_agent("Mozilla/5.0 nock")
+            .build()
+            .unwrap();
+        let minter: Address = "0xa1d79dfa76e98d5e8a776114d9524c4b6e888daa"
+            .parse()
+            .unwrap();
+        let body = post(
+            &http,
+            MINT_ACTION,
+            mint_action_variables(minter, SUSHI.parse().unwrap(), "robinhood"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        match parse_submission(&body) {
+            Err(GqlError::Refused(why)) => println!("understood, and refused with: {why}"),
+            Ok(s) => println!(
+                "understood, and returned {} bytes of calldata",
+                s.data.len()
+            ),
+            Err(other) => panic!("the query was not understood: {other}"),
+        }
     }
 }
