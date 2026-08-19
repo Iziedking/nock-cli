@@ -1,0 +1,74 @@
+{
+  "data": {
+    "dropBySlug": {
+      "__typename": "Erc721SeaDropV1",
+      "minterQuantityMinted": 0,
+      "stages": [
+        {
+          "__typename": "Erc721SeaDropV1Stage",
+          "stageType": "SIGNED_PRESALE",
+          "stageIndex": 1,
+          "isEligible": null,
+          "eligibleMinterAddress": null,
+          "maxTotalMintableByWallet": 100,
+          "eligibleMaxTotalMintableByWallet": null,
+          "eligiblePrice": null
+        },
+        {
+          "__typename": "Erc721SeaDropV1Stage",
+          "stageType": "SIGNED_PRESALE",
+          "stageIndex": 2,
+          "isEligible": null,
+          "eligibleMinterAddress": null,
+          "maxTotalMintableByWallet": 2,
+          "eligibleMaxTotalMintableByWallet": null,
+          "eligiblePrice": null
+        },
+        {
+          "__typename": "Erc721SeaDropV1Stage",
+          "stageType": "SIGNED_PRESALE",
+          "stageIndex": 3,
+          "isEligible": null,
+          "eligibleMinterAddress": null,
+          "maxTotalMintableByWallet": 2,
+          "eligibleMaxTotalMintableByWallet": null,
+          "eligiblePrice": null
+        },
+        {
+          "__typename": "Erc721SeaDropV1Stage",
+          "stageType": "PUBLIC_SALE",
+          "stageIndex": 0,
+          "isEligible": null,
+          "eligibleMinterAddress": null,
+          "maxTotalMintableByWallet": 10,
+          "eligibleMaxTotalMintableByWallet": null,
+          "eligiblePrice": null
+        }
+      ]
+    }
+  },
+  "extensions": {
+    "debugInfo": {
+      "additionalInformation": {
+        "x-trace-id": "a7bc2ccad52e2acd18aeee975ec246bb",
+        "x-ratelimit-remaining": 399,
+        "x-cache": {
+          "graphqlapi": {
+            "control": "public, max-age=2, stale-while-revalidate=3",
+            "status": "MISS"
+          }
+        },
+        "x-federation-duration-ms": 50.6,
+        "cache-control": "no-store"
+      }
+    },
+    "auth": {
+      "error": {
+        "classification": "ACTIVE_ADDRESS_NOT_PROVIDED",
+        "errorType": "UNAUTHENTICATED",
+        "path": "/dropBySlug/stages/eligiblePrice",
+        "message": "Active address was not provided"
+      }
+    }
+  }
+}

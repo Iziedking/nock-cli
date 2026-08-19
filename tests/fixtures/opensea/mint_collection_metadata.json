@@ -1,0 +1,72 @@
+{
+  "data": {
+    "collectionBySlug": {
+      "__typename": "Collection",
+      "slug": "mr-machine",
+      "address": "0x007d9429f709c804fba07954894fc69eba20f495",
+      "chain": {
+        "identifier": "robinhood",
+        "networkId": 4663
+      },
+      "drop": {
+        "__typename": "Erc721SeaDropV1",
+        "identifier": {
+          "contractAddress": "0x007d9429f709c804fba07954894fc69eba20f495",
+          "chain": {
+            "identifier": "robinhood"
+          }
+        },
+        "stages": [
+          {
+            "__typename": "Erc721SeaDropV1Stage",
+            "stageType": "SIGNED_PRESALE",
+            "stageIndex": 1,
+            "startTime": "2026-08-16T01:30:40.000Z",
+            "endTime": "2026-08-16T01:33:40.000Z",
+            "maxTotalMintableByWallet": 100
+          },
+          {
+            "__typename": "Erc721SeaDropV1Stage",
+            "stageType": "SIGNED_PRESALE",
+            "stageIndex": 2,
+            "startTime": "2026-08-16T01:33:40.000Z",
+            "endTime": "2026-08-16T02:03:40.000Z",
+            "maxTotalMintableByWallet": 2
+          },
+          {
+            "__typename": "Erc721SeaDropV1Stage",
+            "stageType": "SIGNED_PRESALE",
+            "stageIndex": 3,
+            "startTime": "2026-08-16T02:03:40.000Z",
+            "endTime": "2026-08-16T02:23:40.000Z",
+            "maxTotalMintableByWallet": 2
+          },
+          {
+            "__typename": "Erc721SeaDropV1Stage",
+            "stageType": "PUBLIC_SALE",
+            "stageIndex": 0,
+            "startTime": "2026-08-16T02:23:40.000Z",
+            "endTime": "2026-08-23T02:23:40.000Z",
+            "maxTotalMintableByWallet": 10
+          }
+        ]
+      }
+    }
+  },
+  "extensions": {
+    "debugInfo": {
+      "additionalInformation": {
+        "x-ratelimit-remaining": 399,
+        "x-trace-id": "933d9ecacd5e8b86f72fc7c64e032546",
+        "x-cache": {
+          "graphqlapi": {
+            "status": "MISS",
+            "control": "public, max-age=2, stale-while-revalidate=3"
+          }
+        },
+        "cache-control": "public, max-age=2, stale-while-revalidate=3",
+        "x-federation-duration-ms": 25.6
+      }
+    }
+  }
+}

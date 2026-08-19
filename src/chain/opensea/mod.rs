@@ -12,5 +12,6 @@
 //! in a single place and can be deleted in one edit when the callers arrive.
 #![allow(dead_code)]
 
+pub mod gql;
 pub mod siwe;
 pub mod verify;

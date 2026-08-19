@@ -1,0 +1,31 @@
+{
+  "data": {
+    "collectionsByQuery": [
+      {
+        "__typename": "Collection",
+        "slug": "sushicatart",
+        "address": "0x941c2a17c60ad6daf86cb6438074d57e906adffa",
+        "chain": {
+          "identifier": "robinhood",
+          "networkId": 4663
+        }
+      }
+    ]
+  },
+  "extensions": {
+    "debugInfo": {
+      "additionalInformation": {
+        "x-cache": {
+          "graphqlapi": {
+            "status": "MISS",
+            "control": "public, max-age=2, stale-while-revalidate=3"
+          }
+        },
+        "x-trace-id": "2062d30480199fabb83ea741a644636e",
+        "x-ratelimit-remaining": 399,
+        "cache-control": "public, max-age=2, stale-while-revalidate=3",
+        "x-federation-duration-ms": 32.1
+      }
+    }
+  }
+}
