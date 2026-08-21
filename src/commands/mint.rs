@@ -7,7 +7,7 @@ use serde_json::json;
 use zeroize::Zeroizing;
 
 use crate::chain::opensea::gql::{
-    self, mint_action_variables, StageType, COLLECTION_METADATA, COLLECTION_SEARCH,
+    self, mint_action_variables, slug_from_link, StageType, COLLECTION_METADATA, COLLECTION_SEARCH,
     DROP_ELIGIBILITY, MINT_ACTION,
 };
 use crate::chain::opensea::siwe::{authenticate, Session};
@@ -77,13 +77,6 @@ pub async fn run(config: &Config, args: MintArgs<'_>) -> ExitCode {
 }
 
 async fn prepare_and_run(config: &Config, args: MintArgs<'_>) -> Result<ExitCode, String> {
-    let collection: Address = args.collection.trim().parse().map_err(|_| {
-        format!(
-            "{} is not an address. It should be 0x and 40 hex characters.",
-            args.collection
-        )
-    })?;
-
     let wallets = unlock_all(&args.wallets)?;
     println!("\n  {} wallet(s) unlocked", wallets.entries.len());
 
@@ -93,7 +86,15 @@ async fn prepare_and_run(config: &Config, args: MintArgs<'_>) -> Result<ExitCode
         .build()
         .map_err(|e| format!("could not build an HTTP client: {e}"))?;
 
-    let (stage, slug) = choose_stage(&mut rpc, &http, collection, args.stage).await?;
+    // An address, an OpenSea link or a bare slug. Somebody looking at a drop
+    // has the link; making them find forty hex characters they cannot
+    // proofread is friction at exactly the wrong moment.
+    let (collection, known_slug) = resolve_collection(&http, args.collection).await?;
+    if let Some(slug) = &known_slug {
+        println!("  {slug} resolves to {collection:?}");
+    }
+
+    let (stage, slug) = choose_stage(&mut rpc, &http, collection, args.stage, known_slug).await?;
     println!(
         "  stage {} is {}, opening at unix {}",
         stage.index,
@@ -432,10 +433,11 @@ async fn choose_stage(
     http: &reqwest::Client,
     collection: Address,
     wanted: Option<u64>,
+    known_slug: Option<String>,
 ) -> Result<(Stage, Option<String>), String> {
     let on_chain: Option<PublicDrop> = public_drop(rpc, collection).await.ok();
 
-    let mut slug = None;
+    let mut slug = known_slug;
     let mut stages: Vec<Stage> = Vec::new();
     if let Ok(body) = gql::post(
         http,
@@ -520,6 +522,34 @@ async fn choose_stage(
         }
     };
     Ok((chosen, slug))
+}
+
+/// Turns whatever the user typed into a contract address.
+///
+/// An address is taken as given. Anything else is treated as an `OpenSea` slug,
+/// or a link with one in it, and resolved through them. Returning the slug too
+/// saves resolving it a second time for the stage list.
+async fn resolve_collection(
+    http: &reqwest::Client,
+    input: &str,
+) -> Result<(Address, Option<String>), String> {
+    let trimmed = input.trim();
+    if let Ok(address) = trimmed.parse::<Address>() {
+        return Ok((address, None));
+    }
+
+    let slug = slug_from_link(trimmed);
+    if slug.is_empty() {
+        return Err(format!("{input} is neither an address nor an OpenSea link"));
+    }
+
+    let body = gql::post(http, COLLECTION_METADATA, json!({ "slug": slug }), None)
+        .await
+        .map_err(|e| format!("could not look up {slug} on OpenSea: {e}"))?;
+    let address = gql::parse_collection_address(&body).map_err(|e| {
+        format!("{input} is not an address, and OpenSea has no collection called {slug}: {e}")
+    })?;
+    Ok((address, Some(slug.to_owned())))
 }
 
 fn now_unix() -> u64 {

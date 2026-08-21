@@ -100,6 +100,32 @@ query MintActionTimelineQuery(
 }
 ";
 
+/// The slug in an `OpenSea` collection link, or the input unchanged.
+///
+/// People have the link, not the address. Asking somebody to go and find a
+/// contract address is asking them to leave the tool at the moment they least
+/// want to, and to paste forty hex characters they cannot proofread.
+///
+/// Handles the shapes a link actually arrives in: with or without a scheme, with
+/// or without `www`, with a trailing path such as `/overview` and with a query
+/// string. Anything that is not an `OpenSea` URL comes back untouched, so a bare
+/// slug and a bare address both pass through.
+pub fn slug_from_link(input: &str) -> &str {
+    let trimmed = input.trim().trim_end_matches('/');
+    let Some(rest) = trimmed.split_once("opensea.io/").map(|(_, rest)| rest) else {
+        return trimmed;
+    };
+    // The slug follows the section, which is /collection/ or /item/<chain>/.
+    let after_section = rest
+        .strip_prefix("collection/")
+        .or_else(|| rest.strip_prefix("assets/"))
+        .unwrap_or(rest);
+    after_section
+        .split(['/', '?', '#'])
+        .find(|part| !part.is_empty())
+        .unwrap_or(after_section)
+}
+
 /// The native token, which is what a mint is paid from.
 pub const NATIVE_TOKEN: &str = "0x0000000000000000000000000000000000000000";
 
@@ -262,6 +288,7 @@ struct MetadataData {
 
 #[derive(Deserialize)]
 struct WireCollectionWithDrop {
+    address: Option<String>,
     drop: Option<WireDrop>,
 }
 
@@ -432,6 +459,20 @@ pub fn parse_collection(json: &str, wanted: Address) -> Result<CollectionRef, Gq
     }
 }
 
+/// The contract address for a slug.
+///
+/// The metadata reply already carries it, so resolving a link costs the request
+/// the stage list needed anyway rather than a second one.
+pub fn parse_collection_address(json: &str) -> Result<Address, GqlError> {
+    let data: MetadataData = envelope(json)?;
+    let raw = data
+        .collection_by_slug
+        .and_then(|c| c.address)
+        .ok_or(GqlError::Missing("collectionBySlug.address"))?;
+    raw.parse()
+        .map_err(|_| GqlError::Malformed(format!("{raw} is not an address")))
+}
+
 pub fn parse_metadata(json: &str) -> Result<Vec<StageMeta>, GqlError> {
     let data: MetadataData = envelope(json)?;
     let drop = data
@@ -569,6 +610,28 @@ mod tests {
 
     const SUSHI: &str = "0x941c2a17c60ad6daf86cb6438074d57e906adffa";
 
+    // People have the link, not the address.
+    #[test]
+    fn it_reads_the_slug_out_of_an_opensea_link() {
+        for link in [
+            "https://opensea.io/collection/sushicatart",
+            "http://opensea.io/collection/sushicatart",
+            "opensea.io/collection/sushicatart",
+            "https://www.opensea.io/collection/sushicatart/",
+            "https://opensea.io/collection/sushicatart/overview",
+            "https://opensea.io/collection/sushicatart?tab=items",
+        ] {
+            assert_eq!(slug_from_link(link), "sushicatart", "failed on {link}");
+        }
+    }
+
+    #[test]
+    fn it_leaves_a_bare_slug_or_address_alone() {
+        assert_eq!(slug_from_link("sushicatart"), "sushicatart");
+        assert_eq!(slug_from_link(SUSHI), SUSHI);
+        assert_eq!(slug_from_link("  sushicatart  "), "sushicatart");
+    }
+
     #[test]
     fn it_finds_the_collection_whose_address_matches() {
         let found = parse_collection(SEARCH, SUSHI.parse().unwrap()).unwrap();
@@ -600,6 +663,23 @@ mod tests {
         assert!(matches!(
             parse_collection(&doubled, SUSHI.parse().unwrap()),
             Err(GqlError::Ambiguous(_))
+        ));
+    }
+
+    // Resolving a link costs no extra request: the stage list reply already
+    // carries the address.
+    #[test]
+    fn it_reads_the_address_out_of_the_metadata_reply() {
+        let found = parse_collection_address(METADATA).unwrap();
+        assert_eq!(format!("{found:?}").len(), 42);
+    }
+
+    #[test]
+    fn it_refuses_a_slug_opensea_does_not_have() {
+        let empty = r#"{"data":{"collectionBySlug":null}}"#;
+        assert!(matches!(
+            parse_collection_address(empty),
+            Err(GqlError::Missing(_))
         ));
     }
 

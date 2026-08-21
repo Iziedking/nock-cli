@@ -65,6 +65,14 @@ Look before you leap. Without `--fire` nothing is ever sent:
 nock mint 0xCollectionAddress --quantity 1 --wallet wallets/main.json
 ```
 
+The collection can be an address, an OpenSea link or a bare slug, because the
+link is what you have when you are looking at a drop:
+
+```bash
+nock mint https://opensea.io/collection/mr-machine --wallet wallets/main.json
+nock mint mr-machine --wallet wallets/main.json
+```
+
 That prints a plan: which stage, when it opens, what it costs, whether your
 wallet covers it, and whether anything is left to mint. Read it, then:
 
