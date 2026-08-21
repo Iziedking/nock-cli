@@ -29,6 +29,21 @@ impl Stage {
         self.kind.is_signed()
     }
 
+    /// Whether this tool can mint this stage at all.
+    ///
+    /// Merkle allowlists cannot. `mintAllowList` takes a proof this tool does
+    /// not build, and `is_signed` is false for them, so without this check a
+    /// merkle stage falls through to the public path and `mintPublic` calldata
+    /// gets built for an allowlist stage. That either reverts, which wastes the
+    /// slot, or mints the public phase by accident at the public price, which is
+    /// worse because it succeeds.
+    ///
+    /// Measured on chain 4663: 50 of 52 collections gate with a signer, so this
+    /// refuses a rounding error rather than a market.
+    pub const fn is_mintable(&self) -> bool {
+        !matches!(self.kind, StageType::MerklePresale)
+    }
+
     pub const fn is_open_at(&self, unix_seconds: u64) -> bool {
         unix_seconds >= self.start_time && unix_seconds < self.end_time
     }
@@ -255,6 +270,27 @@ mod tests {
     #[test]
     fn nothing_moving_is_no_drift() {
         assert!(detect_drift(&public(100), &public(100), &[1, 2], &[1, 2]).is_empty());
+    }
+
+    // Without this a merkle stage reads as "not signed", falls through to the
+    // public path, and mintPublic calldata is built for an allowlist stage.
+    #[test]
+    fn a_merkle_stage_is_refused_rather_than_treated_as_public() {
+        let merkle = Stage {
+            kind: StageType::MerklePresale,
+            ..public(100)
+        };
+        assert!(!merkle.is_signed(), "it is genuinely not a signed stage");
+        assert!(
+            !merkle.is_mintable(),
+            "and it must not be minted as a public one"
+        );
+    }
+
+    #[test]
+    fn the_two_stages_this_tool_serves_are_mintable() {
+        assert!(public(100).is_mintable());
+        assert!(signed(100).is_mintable());
     }
 
     #[test]

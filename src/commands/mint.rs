@@ -490,6 +490,19 @@ async fn choose_stage(
     }
 
     let now = now_unix();
+    // Merkle allowlists are not served: mintAllowList takes a proof this tool
+    // does not build, and letting one through would build public calldata for an
+    // allowlist stage.
+    let (mintable, refused): (Vec<Stage>, Vec<Stage>) =
+        stages.into_iter().partition(Stage::is_mintable);
+    for stage in &refused {
+        println!(
+            "  stage {} is a merkle allowlist, which this tool does not mint",
+            stage.index
+        );
+    }
+    let stages = mintable;
+
     // The earliest stage that has not already ended, so a run started early
     // walks into the first thing it can actually mint.
     let chosen = if let Some(index) = wanted {
