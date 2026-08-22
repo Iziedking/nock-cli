@@ -1,4 +1,4 @@
-/target
+/target/
 
 # Wallets. Encrypted, but a keystore in a public repo is a permanent offline
 # brute-force target, so none of these ever belong in git.
@@ -7,3 +7,8 @@ wallets.json
 nock-wallet.json
 *wallet*.json
 .env
+
+# npm package and GitHub Release build output.
+/dist/
+/node_modules/
+/*.tgz

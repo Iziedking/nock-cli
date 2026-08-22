@@ -14,6 +14,58 @@ and wiped afterwards.
 
 ---
 
+## Coding-agent skill
+
+The repository also ships a coding-agent skill that explains how to install,
+use, and extend Nock without weakening its non-custodial safety boundaries.
+The skill is available through npm and as a GitHub Release ZIP.
+
+### Install through npm
+
+```bash
+npx nock-cli install --agent codex
+npx nock-cli install --agent claude
+npx nock-cli install --agent cursor
+```
+
+Install globally when the installer should remain available:
+
+```bash
+npm install --global nock-cli
+nock-cli install --agent codex
+```
+
+Supported agent targets are `codex`, `claude`, `cursor`, `windsurf`, and
+`gemini`. Install into another coding agent with an explicit directory:
+
+```bash
+nock-cli install --path ~/.my-agent/skills/nock-cli
+```
+
+Pass `--force` to replace an existing installation after reviewing the version.
+
+### Download the skill ZIP
+
+Download `nock-cli-skill.zip` from the
+[latest GitHub Release](https://github.com/Iziedking/nock-cli/releases/latest),
+extract it, and place the `nock-cli-skill` directory under the agent's skills
+directory:
+
+```text
+<agent-skills>/nock-cli/SKILL.md
+<agent-skills>/nock-cli/references/implementation.md
+```
+
+For Codex, the usual user-level location is `~/.codex/skills/nock-cli/`. For
+Claude Code, use `~/.claude/skills/nock-cli/`. Project-local agents can use a
+project `.cursor/skills/nock-cli/` or another path accepted by that agent.
+Start a new agent session after copying the files so the skill is discovered.
+
+The npm installer and release ZIP install the skill only. The native `nock`
+minter remains a separate Rust binary and is installed in the section below.
+
+---
+
 ## Install
 
 Needs Rust 1.90 or later.

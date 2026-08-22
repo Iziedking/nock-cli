@@ -1,0 +1,40 @@
+{
+  "name": "nock-cli",
+  "version": "0.1.0",
+  "description": "Install the Nock coding-agent skill for Claude, Codex, Cursor, Windsurf, and custom agents.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "nock",
+    "coding-agent",
+    "codex",
+    "claude-code",
+    "skills"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Iziedking/nock-cli.git"
+  },
+  "homepage": "https://github.com/Iziedking/nock-cli#readme",
+  "bugs": {
+    "url": "https://github.com/Iziedking/nock-cli/issues"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "nock-cli": "bin/nock-cli.mjs"
+  },
+  "files": [
+    "bin",
+    "skills",
+    "scripts",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "package:skill": "node scripts/package-skill.mjs",
+    "pack:check": "npm pack --dry-run"
+  }
+}
