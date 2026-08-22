@@ -12,7 +12,7 @@ const run = (...args) => execFileSync(process.execPath, [bin, ...args], { encodi
 
 test('prints help and version', () => {
   assert.match(run('--help'), /coding-agent skill installer/)
-  assert.match(run('--version'), /^nock-cli 0\.1\.0\n$/)
+  assert.match(run('--version'), /^nock-cli 0\.1\.1\n$/)
 })
 
 test('installs the skill and references into a custom directory', async () => {
@@ -22,8 +22,10 @@ test('installs the skill and references into a custom directory', async () => {
     assert.match(run('install', '--path', target), /Installed Nock skill/)
     const skill = await readFile(path.join(target, 'SKILL.md'), 'utf8')
     const reference = await readFile(path.join(target, 'references', 'implementation.md'), 'utf8')
+    const mark = await readFile(path.join(target, 'assets', 'nock-mark.svg'), 'utf8')
     assert.match(skill, /name: nock-cli/)
     assert.match(reference, /Required invariants/)
+    assert.match(mark, /aria-label="Nock"/)
   } finally {
     await rm(temp, { recursive: true, force: true })
   }

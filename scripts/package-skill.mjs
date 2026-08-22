@@ -11,6 +11,7 @@ const distRoot = path.join(cliRoot, 'dist')
 const files = [
   ['SKILL.md', 'nock-cli-skill/SKILL.md'],
   ['README.md', 'nock-cli-skill/README.md'],
+  ['assets/nock-mark.svg', 'nock-cli-skill/assets/nock-mark.svg'],
   ['references/implementation.md', 'nock-cli-skill/references/implementation.md'],
   ['../../LICENSE', 'nock-cli-skill/LICENSE'],
 ]

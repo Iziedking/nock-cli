@@ -100,7 +100,8 @@ async function installOne(target, force) {
 }
 
 function help() {
-  return `Nock coding-agent skill installer
+  return `Nock CLI
+Nock coding-agent skill installer
 
 Usage:
   nock-cli install [--agent codex|claude|cursor|windsurf|gemini|all]
@@ -116,6 +117,8 @@ Examples:
 
 The installer copies SKILL.md and its references. It never reads, creates or
 transmits wallet files, private keys, seed phrases or RPC credentials.
+
+The npm package has no runtime dependencies. It installs the Nock skill only.
 `
 }
 

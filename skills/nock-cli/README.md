@@ -1,9 +1,21 @@
+<p align="left">
+  <img src="assets/nock-mark.svg" width="40" alt="Nock mark">
+</p>
+
 # Nock coding-agent skill
+
+Nock gives coding agents a safe, local way to work with the Robinhood Chain
+minting CLI. The Nock skill is a small instruction bundle; it does not install a
+wallet, request a private key, or connect to a hosted minting service.
 
 This bundle teaches a coding agent how to use and extend the Nock self-hosted
 CLI without weakening its non-custodial and mint-safety guarantees.
 
 ## Install with npm
+
+`npx nock-cli` downloads the Nock package from npm. The package has no runtime
+dependencies and installs only the Nock skill files. The native Rust minter is a
+separate installation.
 
 ```bash
 npx nock-cli install --agent codex

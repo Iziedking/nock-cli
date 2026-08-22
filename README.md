@@ -1,4 +1,10 @@
-# nock
+<p align="left">
+  <img src="assets/nock-mark.svg" width="48" alt="Nock mark">
+</p>
+
+# Nock CLI
+
+Your wallet. Your machine. Your call.
 
 A self-hosted minter for Robinhood Chain. Your keys, your machine, nobody's
 permission.
@@ -11,6 +17,9 @@ with a key.
 Nock never asks for a seed phrase and never sends a key anywhere. Keys live in a
 standard v3 keystore on your disk, decrypted into memory for the length of a run
 and wiped afterwards.
+
+This repository is the public home of the Nock CLI and its coding-agent skill.
+The orange mark in this README is the Nock mark used across the product.
 
 ---
 
@@ -44,6 +53,18 @@ nock-cli install --path ~/.my-agent/skills/nock-cli
 
 Pass `--force` to replace an existing installation after reviewing the version.
 
+### What gets downloaded
+
+`npx nock-cli` downloads the Nock package from npm. The package has no runtime
+dependencies. It contains the Nock installer, the Nock coding-agent skill, its
+implementation reference, and the license. It does not create wallets, copy
+keys, install a hosted service, or send credentials anywhere.
+
+The native minter is separate. `cargo build --release` downloads the Rust crates
+listed in `Cargo.lock`, then builds the local `nock` binary. Those crates are
+build dependencies; they are not Nock services and they never receive wallet
+files or transaction credentials.
+
 ### Download the skill ZIP
 
 Download `nock-cli-skill.zip` from the
@@ -66,7 +87,7 @@ minter remains a separate Rust binary and is installed in the section below.
 
 ---
 
-## Install
+## Install the native Nock minter
 
 Needs Rust 1.90 or later.
 

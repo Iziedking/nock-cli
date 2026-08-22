@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 8 8" width="256" height="256" shape-rendering="crispEdges" role="img" aria-label="Nock">
+  <title>Nock</title>
+  <rect x="0" y="0" width="2" height="1" fill="#FFA51F"/>
+  <rect x="6" y="0" width="2" height="1" fill="#FFA51F"/>
+  <rect x="0" y="1" width="3" height="3" fill="#FFA51F"/>
+  <rect x="5" y="1" width="3" height="3" fill="#FFA51F"/>
+  <rect x="0" y="4" width="8" height="4" fill="#FFA51F"/>
+</svg>
