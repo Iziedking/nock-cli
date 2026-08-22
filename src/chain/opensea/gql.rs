@@ -857,7 +857,7 @@ mod tests {
     // OpenSea-shaped looks wrong:
     //   cargo test -- --ignored walks_the_whole_opensea_path --nocapture
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires a live OpenSea SIWE session and network access"]
     async fn walks_the_whole_opensea_path_for_real() {
         use crate::chain::opensea::siwe::authenticate;
         use k256::ecdsa::SigningKey;
@@ -933,7 +933,7 @@ mod tests {
     // reason rather than a schema complaint: a wrong shape fails validation,
     // and a right shape fails on funds.
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires the live private OpenSea GraphQL service"]
     async fn the_mint_action_query_is_understood_by_the_real_service() {
         let http = reqwest::Client::builder()
             .user_agent("Mozilla/5.0 nock")

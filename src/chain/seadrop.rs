@@ -684,7 +684,7 @@ mod tests {
     //   cargo test -- --ignored reads_the_live_bounds
     // whenever the SeaDrop deployment or the chain changes under us.
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires the live Robinhood Chain RPC"]
     async fn reads_the_live_bounds_and_signer_from_chain_4663() {
         use crate::chain::rpc::Rpc;
         use std::time::Duration;

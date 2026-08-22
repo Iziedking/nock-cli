@@ -492,7 +492,7 @@ mod tests {
     #[test]
     fn it_accepts_a_zero_minter_word_as_the_payer_minting_for_itself() {
         let (mut s, e) = real_public();
-        for byte in s.data[4 + 2 * 32..4 + 3 * 32].iter_mut() {
+        for byte in &mut s.data[4 + 2 * 32..4 + 3 * 32] {
             *byte = 0;
         }
         assert!(verify(&s, &e).is_ok());

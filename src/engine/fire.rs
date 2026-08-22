@@ -103,7 +103,7 @@ mod tests {
             address: Address::ZERO,
             nonce: index as u64,
             signed: Signed {
-                hash: Default::default(),
+                hash: alloy_primitives::B256::default(),
                 raw: vec![1, 2, 3],
             },
         }

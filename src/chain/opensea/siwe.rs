@@ -401,7 +401,7 @@ mod tests {
     // A throwaway key is enough: signing in proves an address, and an address
     // that holds nothing can still prove itself.
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires live OpenSea SIWE endpoints and network access"]
     async fn signs_in_to_opensea_for_real() {
         let secret = Zeroizing::new([0x7fu8; 32]);
         let key = SigningKey::from_slice(&secret[..]).unwrap();
