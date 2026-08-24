@@ -309,7 +309,7 @@ async fn signed_calldata(
 /// Waits for the open and sends every ready wallet at once.
 async fn fire_stage(
     config: &Config,
-    rpc: Rpc,
+    mut rpc: Rpc,
     plan: &StagePlan,
     prepared: &[Prepared],
 ) -> Result<ExitCode, String> {
@@ -360,6 +360,8 @@ async fn fire_stage(
             index: prep.candidate.index,
             address: prep.address,
             nonce: prep.nonce,
+            value_wei: prep.value_wei,
+            calldata: prep.calldata.clone(),
             signed,
         });
     }
@@ -373,6 +375,28 @@ async fn fire_stage(
         clock
             .assert_usable()
             .map_err(|e| format!("refusing to fire, the clock moved during the wait: {e}"))?;
+    }
+
+    // The stage can change while we wait. On Robinhood Chain a reverting mint
+    // still costs gas, so simulate every exact transaction against the latest
+    // state before sending any of the batch. A single refusal aborts the batch
+    // rather than letting the other wallets race into a state we have not
+    // proved safe.
+    for shot in &shots {
+        let tx = json!({
+            "from": format!("{:?}", shot.address),
+            "to": SEADROP,
+            "value": format!("0x{:x}", shot.value_wei),
+            "data": format!("0x{}", hex::encode(&shot.calldata)),
+        });
+        rpc.call::<String>("eth_estimateGas", json!([tx, "latest"]))
+            .await
+            .map_err(|e| {
+                format!(
+                    "preflight refused wallet {} immediately before send: {e}",
+                    shot.index
+                )
+            })?;
     }
 
     // The closure owns its endpoints rather than borrowing the config, because
@@ -457,6 +481,27 @@ async fn choose_stage(
             .await
             {
                 if let Ok(list) = gql::parse_metadata(&meta) {
+                    if let Some(public) =
+                        list.iter().find(|m| m.stage_type == StageType::PublicSale)
+                    {
+                        let drop = on_chain.ok_or_else(|| {
+                            "OpenSea published a public stage, but the chain did not return a public drop".to_owned()
+                        })?;
+                        if public.start_time != drop.start_time
+                            || public.end_time != drop.end_time
+                            || public.max_total_mintable_by_wallet != u64::from(drop.max_per_wallet)
+                        {
+                            return Err(format!(
+                                "OpenSea and Robinhood Chain disagree about the public stage: OpenSea {}-{} ({} per wallet), chain {}-{} ({} per wallet). Re-run after the collection updates its on-chain schedule.",
+                                public.start_time,
+                                public.end_time,
+                                public.max_total_mintable_by_wallet,
+                                drop.start_time,
+                                drop.end_time,
+                                drop.max_per_wallet
+                            ));
+                        }
+                    }
                     stages = list
                         .iter()
                         .map(|m| {

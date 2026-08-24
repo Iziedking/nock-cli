@@ -5,6 +5,11 @@ use thiserror::Error;
 use super::siwe::Session;
 use super::verify::SubmissionData;
 
+/// OpenSea can return the same contract address for more than one network.
+/// Nock only mints on Robinhood Chain, so address equality alone is not enough
+/// to choose a collection.
+pub const ROBINHOOD_NETWORK_ID: u64 = 4663;
+
 /// The four operations this tool sends, and nothing else.
 ///
 /// Sent as query documents rather than persisted-query hashes. Measured
@@ -442,7 +447,10 @@ pub fn parse_collection(json: &str, wanted: Address) -> Result<CollectionRef, Gq
     let mut matches = data
         .collections_by_query
         .into_iter()
-        .filter(|c| c.address.parse::<Address>().is_ok_and(|a| a == wanted))
+        .filter(|c| {
+            c.chain.network_id == ROBINHOOD_NETWORK_ID
+                && c.address.parse::<Address>().is_ok_and(|a| a == wanted)
+        })
         .collect::<Vec<_>>();
 
     match matches.len() {
@@ -635,6 +643,20 @@ mod tests {
     #[test]
     fn it_finds_the_collection_whose_address_matches() {
         let found = parse_collection(SEARCH, SUSHI.parse().unwrap()).unwrap();
+        assert_eq!(found.slug, "sushicatart");
+        assert_eq!(found.network_id, 4663);
+    }
+
+    #[test]
+    fn it_ignores_an_ethereum_result_for_the_same_address() {
+        let address = "0x941c2a17c60ad6daf86cb6438074d57e906adffa";
+        let cross_chain = format!(
+            r#"{{"data":{{"collectionsByQuery":[
+                {{"__typename":"Collection","slug":"ethereum-copy","address":"{address}","chain":{{"identifier":"ethereum","networkId":1}}}},
+                {{"__typename":"Collection","slug":"sushicatart","address":"{address}","chain":{{"identifier":"robinhood","networkId":4663}}}}
+            ]}}}}"#
+        );
+        let found = parse_collection(&cross_chain, address.parse().unwrap()).unwrap();
         assert_eq!(found.slug, "sushicatart");
         assert_eq!(found.network_id, 4663);
     }

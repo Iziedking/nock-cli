@@ -31,6 +31,8 @@ pub struct Shot {
     pub index: usize,
     pub address: Address,
     pub nonce: u64,
+    pub value_wei: u128,
+    pub calldata: Vec<u8>,
     pub signed: Signed,
 }
 
@@ -102,6 +104,8 @@ mod tests {
             index,
             address: Address::ZERO,
             nonce: index as u64,
+            value_wei: 0,
+            calldata: Vec::new(),
             signed: Signed {
                 hash: alloy_primitives::B256::default(),
                 raw: vec![1, 2, 3],
