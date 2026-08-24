@@ -5,7 +5,7 @@ use thiserror::Error;
 use super::siwe::Session;
 use super::verify::SubmissionData;
 
-/// OpenSea can return the same contract address for more than one network.
+/// `OpenSea` can return the same contract address for more than one network.
 /// Nock only mints on Robinhood Chain, so address equality alone is not enough
 /// to choose a collection.
 pub const ROBINHOOD_NETWORK_ID: u64 = 4663;

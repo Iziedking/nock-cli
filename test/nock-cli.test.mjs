@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { readFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -8,11 +9,12 @@ import assert from 'node:assert/strict'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const bin = path.join(root, 'bin', 'nock-cli.mjs')
+const packageVersion = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8')).version
 const run = (...args) => execFileSync(process.execPath, [bin, ...args], { encoding: 'utf8' })
 
 test('prints help and version', () => {
   assert.match(run('--help'), /coding-agent skill installer/)
-  assert.match(run('--version'), /^nock-cli 0\.1\.1\n$/)
+  assert.equal(run('--version'), `nock-cli ${packageVersion}\n`)
 })
 
 test('installs the skill and references into a custom directory', async () => {

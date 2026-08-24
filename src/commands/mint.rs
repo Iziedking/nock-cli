@@ -306,32 +306,15 @@ async fn signed_calldata(
     }
 }
 
-/// Waits for the open and sends every ready wallet at once.
-async fn fire_stage(
+/// Signs the ready wallets before the freeze window begins.
+fn sign_ready_shots(
     config: &Config,
-    mut rpc: Rpc,
     plan: &StagePlan,
     prepared: &[Prepared],
-) -> Result<ExitCode, String> {
-    let clock = Clock::new();
-    let open_at_ms = i64::try_from(plan.stage.start_time).unwrap_or(0) * 1_000;
-    let remaining = open_at_ms - clock.now_ms();
-
-    if remaining > 0 {
-        clock
-            .assert_usable()
-            .map_err(|e| format!("refusing to fire at a stage that has not opened: {e}"))?;
-        if remaining > READY_BY_SECONDS * 1_000 {
-            println!(
-                "  Waiting {} seconds for the stage to open.",
-                remaining / 1_000
-            );
-        } else {
-            println!("  Opens in {remaining} ms.");
-        }
-    }
-
-    // Signed before the wait, so at T-0 there is nothing left to compute.
+) -> Result<Vec<Shot>, String> {
+    let to = SEADROP
+        .parse()
+        .map_err(|_| "bad SeaDrop address".to_owned())?;
     let mut shots = Vec::new();
     for prep in prepared {
         if !plan
@@ -347,9 +330,7 @@ async fn fire_stage(
             max_priority_fee_per_gas: 0,
             max_fee_per_gas: prep.max_fee,
             gas_limit: GAS_LIMIT,
-            to: SEADROP
-                .parse()
-                .map_err(|_| "bad SeaDrop address".to_owned())?,
+            to,
             value: prep.value_wei,
             data: prep.calldata.clone(),
         };
@@ -366,23 +347,12 @@ async fn fire_stage(
         });
     }
     println!("  {} transaction(s) signed and frozen\n", shots.len());
+    Ok(shots)
+}
 
-    if remaining > 0 && remaining < FREEZE_SECONDS * 1_000 {
-        println!("  Inside the freeze window. Nothing further will be fetched or re-signed.");
-    }
-    clock.sleep_until(open_at_ms).await;
-    if remaining > 0 {
-        clock
-            .assert_usable()
-            .map_err(|e| format!("refusing to fire, the clock moved during the wait: {e}"))?;
-    }
-
-    // The stage can change while we wait. On Robinhood Chain a reverting mint
-    // still costs gas, so simulate every exact transaction against the latest
-    // state before sending any of the batch. A single refusal aborts the batch
-    // rather than letting the other wallets race into a state we have not
-    // proved safe.
-    for shot in &shots {
+/// Simulates each exact transaction against the latest chain state.
+async fn preflight_shots(rpc: &mut Rpc, shots: &[Shot]) -> Result<(), String> {
+    for shot in shots {
         let tx = json!({
             "from": format!("{:?}", shot.address),
             "to": SEADROP,
@@ -398,11 +368,15 @@ async fn fire_stage(
                 )
             })?;
     }
+    Ok(())
+}
 
+/// Sends the frozen transactions and classifies each result from chain state.
+async fn send_and_classify(config: &Config, shots: &[Shot]) -> Vec<WalletOutcome> {
     // The closure owns its endpoints rather than borrowing the config, because
     // each send runs on its own task and a borrow cannot outlive this function.
     let send_urls: Vec<String> = config.send_urls();
-    let sent = fire_all_with(shots.clone(), move |shot: Shot| {
+    let sent = fire_all_with(shots.to_vec(), move |shot: Shot| {
         let send_urls = send_urls.clone();
         async move {
             let out = send_to(&send_urls, &shot.signed).await;
@@ -441,6 +415,51 @@ async fn fire_stage(
             tx_hash: result.dispatch.as_ref().ok().cloned(),
         });
     }
+    results
+}
+
+/// Waits for the open and sends every ready wallet at once.
+async fn fire_stage(
+    config: &Config,
+    mut rpc: Rpc,
+    plan: &StagePlan,
+    prepared: &[Prepared],
+) -> Result<ExitCode, String> {
+    let clock = Clock::new();
+    let open_at_ms = i64::try_from(plan.stage.start_time).unwrap_or(0) * 1_000;
+    let remaining = open_at_ms - clock.now_ms();
+
+    if remaining > 0 {
+        clock
+            .assert_usable()
+            .map_err(|e| format!("refusing to fire at a stage that has not opened: {e}"))?;
+        if remaining > READY_BY_SECONDS * 1_000 {
+            println!(
+                "  Waiting {} seconds for the stage to open.",
+                remaining / 1_000
+            );
+        } else {
+            println!("  Opens in {remaining} ms.");
+        }
+    }
+
+    // Signed before the wait, so at T-0 there is nothing left to compute.
+    let shots = sign_ready_shots(config, plan, prepared)?;
+    if remaining > 0 && remaining < FREEZE_SECONDS * 1_000 {
+        println!("  Inside the freeze window. Nothing further will be fetched or re-signed.");
+    }
+    clock.sleep_until(open_at_ms).await;
+    if remaining > 0 {
+        clock
+            .assert_usable()
+            .map_err(|e| format!("refusing to fire, the clock moved during the wait: {e}"))?;
+    }
+
+    // On Robinhood Chain a reverting mint still costs gas. A single preflight
+    // refusal aborts the batch rather than letting the other wallets race into
+    // a state we have not proved safe.
+    preflight_shots(&mut rpc, &shots).await?;
+    let results = send_and_classify(config, &shots).await;
 
     drop(rpc);
     println!("{}", render_outcome_table(&results));
