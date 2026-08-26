@@ -1,0 +1,28 @@
+{
+  "poll_seconds": 5,
+  "window_seconds": 60,
+  "state_file": "/var/lib/nock/goat-street-cron.json",
+  "jobs": [
+    {
+      "id": "goat-street-gtd",
+      "collection": "0xc21159f412c294ca2c38f2a9ecaaccf9d93ec929",
+      "stage": 2,
+      "quantity": 1,
+      "wallet": "/var/lib/nock/wallets/goat.json"
+    },
+    {
+      "id": "goat-street-fcfs",
+      "collection": "0xc21159f412c294ca2c38f2a9ecaaccf9d93ec929",
+      "stage": 3,
+      "quantity": 1,
+      "wallet": "/var/lib/nock/wallets/goat.json"
+    },
+    {
+      "id": "goat-street-public",
+      "collection": "0xc21159f412c294ca2c38f2a9ecaaccf9d93ec929",
+      "stage": 0,
+      "quantity": 1,
+      "wallet": "/var/lib/nock/wallets/goat.json"
+    }
+  ]
+}

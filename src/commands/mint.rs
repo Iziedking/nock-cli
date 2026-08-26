@@ -471,7 +471,7 @@ async fn fire_stage(
 /// The chain is asked first and is enough on its own for a public stage. `OpenSea`
 /// is consulted for the stage list because signed stages are invisible from
 /// chain alone, and its absence is not fatal.
-async fn choose_stage(
+pub(crate) async fn choose_stage(
     rpc: &mut Rpc,
     http: &reqwest::Client,
     collection: Address,
@@ -593,7 +593,7 @@ async fn choose_stage(
 /// An address is taken as given. Anything else is treated as an `OpenSea` slug,
 /// or a link with one in it, and resolved through them. Returning the slug too
 /// saves resolving it a second time for the stage list.
-async fn resolve_collection(
+pub(crate) async fn resolve_collection(
     http: &reqwest::Client,
     input: &str,
 ) -> Result<(Address, Option<String>), String> {

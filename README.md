@@ -89,7 +89,7 @@ minter remains a separate Rust binary and is installed in the section below.
 
 ## Install the native Nock minter
 
-Needs Rust 1.90 or later.
+Needs Rust 1.97.1 or later.
 
 ```bash
 git clone https://github.com/Iziedking/nock-cli
@@ -197,6 +197,170 @@ the run takes the earliest one that has not ended.
 ```bash
 nock mint 0xCollection --stage 2 --wallet wallets/main.json
 ```
+
+## Last-minute cron protection
+
+If you do not want to be online at the exact opening time, `nock cron` can
+watch several stages and make one controlled attempt for each one. It is a
+general scheduler, not a Goat Street special case: the collection, stage and
+wallet are all supplied in the schedule file.
+
+The scheduler is deliberately conservative:
+
+- it is dry-run unless you add `--fire`
+- it only acts during the 60 seconds before a stage opens
+- it records its state and takes one scheduled attempt per job
+- before acting, it compares the wallet's pending nonce and NFT balance with a
+  pre-window baseline
+- if you sent a manual transaction, the job is marked as handled and cron
+  stands down
+- a scheduled transaction is never automatically retried, because an accepted
+  transaction can be real even when a receipt check is temporarily unavailable
+
+This prevents the scheduler from competing with a manual mint from the same
+wallet. Use a dedicated mint wallet; an unrelated transaction from that wallet
+also counts as manual activity and safely causes cron to stand down.
+
+Create a schedule such as this one. The stage numbers below match the Goat
+Street drop: GTD is stage 2, FCFS is stage 3, and public is stage 0. Other
+collections use their own stage numbers.
+
+```json
+{
+  "poll_seconds": 5,
+  "window_seconds": 60,
+  "state_file": "/var/lib/nock/goat-street-cron.json",
+  "jobs": [
+    {
+      "id": "goat-street-gtd",
+      "collection": "0xc21159f412c294ca2c38f2a9ecaaccf9d93ec929",
+      "stage": 2,
+      "quantity": 1,
+      "wallet": "/var/lib/nock/wallets/goat.json"
+    },
+    {
+      "id": "goat-street-fcfs",
+      "collection": "0xc21159f412c294ca2c38f2a9ecaaccf9d93ec929",
+      "stage": 3,
+      "quantity": 1,
+      "wallet": "/var/lib/nock/wallets/goat.json"
+    },
+    {
+      "id": "goat-street-public",
+      "collection": "0xc21159f412c294ca2c38f2a9ecaaccf9d93ec929",
+      "stage": 0,
+      "quantity": 1,
+      "wallet": "/var/lib/nock/wallets/goat.json"
+    }
+  ]
+}
+```
+
+Run a one-time dry run first:
+
+```bash
+nock cron \
+  --schedule /etc/nock/goat-street.json \
+  --passphrase-file /etc/nock/goat.pass \
+  --once
+```
+
+Then leave the dry-run scheduler running before the drop. It will arm its
+baseline and print the plan in the final minute, but it cannot broadcast:
+
+```bash
+nock cron \
+  --schedule /etc/nock/goat-street.json \
+  --passphrase-file /etc/nock/goat.pass
+```
+
+Only after reviewing that test should the production launch command include
+`--fire`:
+
+```bash
+nock cron \
+  --schedule /etc/nock/goat-street.json \
+  --passphrase-file /etc/nock/goat.pass \
+  --fire
+```
+
+The passphrase file is the explicit tradeoff for unattended signing. It must
+be readable only by the account running Nock (`chmod 600`) and should live on a
+locked machine. Nock reads it into memory for the child mint process and never
+puts it in an argument or log. If you do not want an at-rest passphrase file,
+run the normal `nock mint` command manually instead.
+
+### Running the CLI on `nock-vm`
+
+The CLI does not use the Telegram bot's hosted wallet. Build the binary and
+copy it to the VM, then keep the CLI wallet and cron state in their own
+directories:
+
+```bash
+# From the repository checkout on your workstation
+cargo build --release --manifest-path cli/Cargo.toml
+scp cli/target/release/nock nock-vm:/tmp/nock
+scp cli/examples/goat-street.json nock-vm:/tmp/goat-street.json
+
+# On nock-vm
+sudo install -d -o root -g root -m 0755 /opt/nock
+sudo install -o root -g root -m 0755 /tmp/nock /opt/nock/nock
+sudo install -d -o nock -g nock -m 0700 /etc/nock
+sudo install -o nock -g nock -m 0600 /tmp/goat-street.json /etc/nock/goat-street.json
+sudo install -d -o nock -g nock -m 0700 /var/lib/nock/wallets
+sudo install -d -o nock -g nock -m 0700 /var/lib/nock
+```
+
+Copy the encrypted keystore to `/var/lib/nock/wallets/goat.json`, owned by the
+service account. Create `/etc/nock/nock.env` with mode 600 and set the RPC
+variables there, for example `NOCK_RPC_URLS` with Alchemy first and the public
+Robinhood endpoint second. Keep the Alchemy URL out of shell history and logs.
+
+Create the passphrase file interactively on the VM:
+
+```bash
+sudo -u nock sh -c 'umask 077; printf "Passphrase: "; read -r -s p; printf "\\n"; printf "%s\\n" "$p" > /etc/nock/goat.pass; unset p'
+sudo chmod 600 /etc/nock/goat.pass
+sudo chown nock:nock /etc/nock/goat.pass
+```
+
+Test without fire:
+
+```bash
+sudo -u nock sh -lc '. /etc/nock/nock.env; /opt/nock/nock doctor'
+sudo -u nock sh -lc '. /etc/nock/nock.env; /opt/nock/nock cron --schedule /etc/nock/goat-street.json --passphrase-file /etc/nock/goat.pass --once'
+```
+
+For a cron-launched resident scheduler, create `/usr/local/sbin/nock-cron`
+with `sudoedit`:
+
+```sh
+#!/bin/sh
+set -eu
+. /etc/nock/nock.env
+exec /opt/nock/nock cron \
+  --schedule /etc/nock/goat-street.json \
+  --passphrase-file /etc/nock/goat.pass
+```
+
+Make it executable and launch the dry-run service at boot:
+
+```bash
+sudo chmod 0755 /usr/local/sbin/nock-cron
+sudo crontab -u nock -e
+```
+
+Add this line while testing:
+
+```cron
+@reboot /usr/local/sbin/nock-cron >>/var/lib/nock/cron.log 2>&1
+```
+
+When the dry-run has been reviewed, add `--fire` to the wrapper. Do not run a
+second copy: the state lock refuses duplicate schedulers, and the state file
+must remain on persistent disk. A systemd service with `Restart=on-failure` is
+preferable if you want automatic restart after a VM process failure; the CLI
+behavior and the dry-run/`--fire` boundary are identical.
 
 ## What it can and cannot mint
 

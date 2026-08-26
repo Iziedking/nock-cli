@@ -63,6 +63,27 @@ enum Command {
         #[arg(long, value_name = "ETH")]
         max_spend: Option<String>,
     },
+    /// Watch configured mint stages and make one last-minute attempt if no
+    /// manual transaction has used the wallet. Dry-run unless --fire is set.
+    Cron {
+        /// JSON schedule file containing one or more stage jobs.
+        #[arg(long, short)]
+        schedule: PathBuf,
+        /// Actually allow the scheduler to broadcast. Without this it only
+        /// plans and reports.
+        #[arg(long)]
+        fire: bool,
+        /// Inspect the schedule once and exit instead of staying resident.
+        #[arg(long)]
+        once: bool,
+        /// Seconds between scheduler checks.
+        #[arg(long, default_value_t = 5)]
+        interval: u64,
+        /// Read the keystore passphrase from this 0600 file. Required for an
+        /// unattended scheduler on a server.
+        #[arg(long)]
+        passphrase_file: Option<PathBuf>,
+    },
     /// Create and inspect the encrypted wallet this machine mints with.
     Wallets {
         #[command(subcommand)]
@@ -150,6 +171,25 @@ async fn main() -> std::process::ExitCode {
                     wallets,
                     stage,
                     fire,
+                },
+            )
+            .await
+        }
+        Command::Cron {
+            schedule,
+            fire,
+            once,
+            interval,
+            passphrase_file,
+        } => {
+            commands::cron::run(
+                &config,
+                commands::cron::CronArgs {
+                    schedule,
+                    fire,
+                    once,
+                    interval,
+                    passphrase_file,
                 },
             )
             .await
