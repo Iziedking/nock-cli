@@ -27,6 +27,23 @@ const DEFAULT_WINDOW_SECONDS: u64 = 60;
 const DEFAULT_POLL_SECONDS: u64 = 5;
 const STAGE_REFRESH_SECONDS: u64 = 15;
 
+#[derive(Debug, PartialEq, Eq)]
+enum StageWindow {
+    Before,
+    Open,
+    Ended,
+}
+
+fn stage_window(now: u64, start_time: u64, end_time: u64) -> StageWindow {
+    if now < start_time {
+        StageWindow::Before
+    } else if now < end_time {
+        StageWindow::Open
+    } else {
+        StageWindow::Ended
+    }
+}
+
 #[derive(Debug)]
 pub struct CronArgs {
     pub schedule: PathBuf,
@@ -288,25 +305,30 @@ async fn process_job(
         return Ok(changed);
     }
 
-    if now >= window.start_time {
-        if now < window.end_time {
-            job_state.attempted = true;
-            job_state.last_action = Some("missed_last_minute_window".to_owned());
-            println!(
-                "  [{}] missed: the stage is open, and cron only fires before the open",
-                job.id
-            );
-        } else {
+    match stage_window(now, window.start_time, window.end_time) {
+        StageWindow::Ended => {
             job_state.attempted = true;
             job_state.last_action = Some("stage_ended".to_owned());
             println!("  [{}] ended without a scheduled attempt", job.id);
+            return Ok(true);
         }
-        return Ok(true);
-    }
-
-    let seconds_until_open = window.start_time.saturating_sub(now);
-    if seconds_until_open > context.window_seconds {
-        return Ok(changed);
+        // A stage can open earlier than the published timestamp, or the
+        // machine can be restarted after the last-minute window. The contract
+        // and the live mint simulation are the authority in that case. The
+        // baseline check above still prevents a manual mint from being
+        // duplicated.
+        StageWindow::Before => {
+            let seconds_until_open = window.start_time.saturating_sub(now);
+            if seconds_until_open > context.window_seconds {
+                return Ok(changed);
+            }
+        }
+        StageWindow::Open => {
+            println!(
+                "  [{}] stage is already open; checking for a safe mint now",
+                job.id
+            );
+        }
     }
 
     let current = capture_baseline(context.config, &job.collection, &target_paths).await?;
@@ -754,6 +776,18 @@ mod tests {
         after[0].pending_nonce = 4;
         after[0].nft_balance = 3;
         assert!(manual_activity(&before, &after));
+    }
+
+    #[test]
+    fn an_open_stage_remains_attemptable() {
+        assert_eq!(stage_window(110, 100, 200), StageWindow::Open);
+        assert_eq!(stage_window(100, 100, 200), StageWindow::Open);
+    }
+
+    #[test]
+    fn a_future_stage_is_not_open_and_an_ended_stage_is_closed() {
+        assert_eq!(stage_window(99, 100, 200), StageWindow::Before);
+        assert_eq!(stage_window(200, 100, 200), StageWindow::Ended);
     }
 
     #[test]
