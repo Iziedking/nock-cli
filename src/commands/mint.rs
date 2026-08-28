@@ -49,6 +49,12 @@ const FREEZE_SECONDS: i64 = 30;
 /// Far enough out that waiting is worth saying out loud.
 const READY_BY_SECONDS: i64 = 30;
 
+/// `OpenSea`'s eligibility view can briefly lag the mint action used by its UI.
+/// Keep the fallback short: it is for a settling response, not for waiting
+/// through a closed or sold-out stage.
+const MINT_ACTION_RETRIES: usize = 3;
+const MINT_ACTION_RETRY_DELAY: Duration = Duration::from_secs(1);
+
 pub struct MintArgs<'a> {
     pub collection: &'a str,
     pub quantity: u64,
@@ -275,19 +281,25 @@ async fn signed_calldata(
             )
         })?;
     if !mine.is_eligible {
-        return Err(format!("not on the list for stage {}", input.stage.index));
+        // This is not enough to stop. The web UI can show the same wallet as
+        // ineligible for one request and eligible after a refresh while its
+        // signed mint action is already available. The action response is the
+        // stronger check because it contains the collection's authorization.
+        println!(
+            "  OpenSea eligibility is unsettled for stage {}; checking the live mint action",
+            input.stage.index
+        );
     }
 
-    let body = gql::post(
+    let submission = request_signed_mint_action(
         http,
-        MINT_ACTION,
-        mint_action_variables(address, input.collection, "robinhood", quantity),
-        Some(&session),
+        &session,
+        address,
+        input.collection,
+        input.stage.index,
+        quantity,
     )
-    .await
-    .map_err(|e| format!("could not fetch calldata: {e}"))?;
-    let submission =
-        gql::parse_submission(&body).map_err(|e| format!("could not fetch calldata: {e}"))?;
+    .await?;
 
     // Nothing reaches the signer until this passes.
     let expectation = Expectation {
@@ -304,6 +316,44 @@ async fn signed_calldata(
         Ok(_) => Ok((submission.data, submission.value_wei, None)),
         Err(refusal) => Ok((Vec::new(), 0, Some(refusal))),
     }
+}
+
+/// Ask `OpenSea` for the transaction it would actually give the web UI.
+///
+/// A short retry absorbs the observed eligibility-cache race. We still require
+/// the normal calldata verification below, so a successful fallback can only
+/// produce a transaction authorized for this wallet and signed stage.
+async fn request_signed_mint_action(
+    http: &reqwest::Client,
+    session: &Session,
+    address: Address,
+    collection: Address,
+    stage_index: u64,
+    quantity: u64,
+) -> Result<crate::chain::opensea::verify::SubmissionData, String> {
+    let variables = mint_action_variables(address, collection, "robinhood", quantity);
+    let mut last_refusal = None;
+
+    for attempt in 0..MINT_ACTION_RETRIES {
+        let body = gql::post(http, MINT_ACTION, variables.clone(), Some(session))
+            .await
+            .map_err(|e| format!("could not fetch calldata: {e}"))?;
+        match gql::parse_submission(&body) {
+            Ok(submission) => return Ok(submission),
+            Err(gql::GqlError::Refused(reason)) => {
+                last_refusal = Some(reason);
+                if attempt + 1 < MINT_ACTION_RETRIES {
+                    tokio::time::sleep(MINT_ACTION_RETRY_DELAY).await;
+                }
+            }
+            Err(error) => return Err(format!("could not fetch calldata: {error}")),
+        }
+    }
+
+    Err(format!(
+        "not eligible for stage {stage_index}; OpenSea refused the live mint action after {MINT_ACTION_RETRIES} attempts: {}",
+        last_refusal.unwrap_or_else(|| "no transaction was returned".to_owned())
+    ))
 }
 
 /// Signs the ready wallets before the freeze window begins.
