@@ -6,6 +6,7 @@
 wallets.json
 nock-wallet.json
 *wallet*.json
+/wallets/
 .env
 
 # npm package and GitHub Release build output.
