@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use alloy_primitives::Address;
 use serde_json::json;
@@ -53,7 +53,13 @@ const READY_BY_SECONDS: i64 = 30;
 /// Keep the fallback short: it is for a settling response, not for waiting
 /// through a closed or sold-out stage.
 const MINT_ACTION_RETRIES: usize = 3;
-const MINT_ACTION_RETRY_DELAY: Duration = Duration::from_secs(1);
+const MINT_ACTION_RETRY_DELAY: Duration = Duration::from_secs(2);
+const MINT_ACTION_RATE_LIMIT_DELAY: Duration = Duration::from_secs(5);
+const MINT_ACTION_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// Do not spend the whole final minute polling `OpenSea`. Its signed action is
+/// useful only near opening, and a warm request at T-5 leaves enough time to
+/// absorb cache lag without needlessly consuming the endpoint's rate limit.
+const MINT_ACTION_FIRST_CHECK_SECONDS: u64 = 5;
 /// A signed mint action can appear only after the stage opens, even when
 /// `OpenSea` published the stage hours earlier. An armed fire run waits through
 /// that cache-settling boundary instead of spending its only attempt early.
@@ -62,7 +68,15 @@ const MINT_ACTION_OPEN_GRACE_SECONDS: u64 = 30;
 const MINT_ACTION_MAX_WAIT_SECONDS: u64 = 120;
 const PREFLIGHT_RETRIES: usize = 3;
 const PREFLIGHT_RETRY_DELAY: Duration = Duration::from_secs(1);
+const PREFLIGHT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const PREFLIGHT_OPEN_GRACE_SECONDS: u64 = 30;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RetryPlan {
+    initial_delay: Duration,
+    deadline_after: Option<Duration>,
+    max_attempts: Option<usize>,
+}
 
 pub struct MintArgs<'a> {
     pub collection: &'a str,
@@ -309,7 +323,7 @@ async fn signed_calldata(
         input.collection,
         input.stage.index,
         quantity,
-        mint_action_attempts(input.stage.start_time, input.fire, now_unix()),
+        mint_action_retry_plan(input.stage.start_time, input.fire, now_unix()),
     )
     .await?;
 
@@ -342,25 +356,71 @@ async fn request_signed_mint_action(
     collection: Address,
     stage_index: u64,
     quantity: u64,
-    attempts: usize,
+    retry: RetryPlan,
 ) -> Result<crate::chain::opensea::verify::SubmissionData, String> {
     let variables = mint_action_variables(address, collection, "robinhood", quantity);
     let mut last_error = None;
+    let mut attempts = 0_usize;
+    let deadline = retry.deadline_after.map(|after| Instant::now() + after);
 
-    for attempt in 0..attempts {
-        let result = match gql::post(http, MINT_ACTION, variables.clone(), Some(session)).await {
-            Ok(body) => gql::parse_submission(&body),
-            Err(error) => Err(error),
+    if !retry.initial_delay.is_zero() {
+        tokio::time::sleep(retry.initial_delay).await;
+    }
+
+    loop {
+        if retry.max_attempts.is_some_and(|limit| attempts >= limit) {
+            break;
+        }
+        let request_timeout = deadline.map_or(MINT_ACTION_REQUEST_TIMEOUT, |until| {
+            until
+                .saturating_duration_since(Instant::now())
+                .min(MINT_ACTION_REQUEST_TIMEOUT)
+        });
+        if request_timeout.is_zero() {
+            break;
+        }
+
+        attempts = attempts.saturating_add(1);
+        let result = match tokio::time::timeout(
+            request_timeout,
+            gql::post(http, MINT_ACTION, variables.clone(), Some(session)),
+        )
+        .await
+        {
+            Ok(Ok(body)) => gql::parse_submission(&body),
+            Ok(Err(error)) => Err(error),
+            Err(_) => {
+                last_error = Some(format!(
+                    "OpenSea did not answer within {} seconds",
+                    request_timeout.as_secs()
+                ));
+                if retry.max_attempts.is_some_and(|limit| attempts >= limit) {
+                    break;
+                }
+                if !sleep_before_retry(MINT_ACTION_RETRY_DELAY, deadline).await {
+                    break;
+                }
+                continue;
+            }
         };
         match result {
             Ok(submission) => return Ok(submission),
             Err(gql::GqlError::Malformed(reason)) => {
                 return Err(format!("could not fetch calldata: {reason}"));
             }
-            Err(error) => last_error = Some(error.to_string()),
-        }
-        if attempt + 1 < attempts {
-            tokio::time::sleep(MINT_ACTION_RETRY_DELAY).await;
+            Err(error) => {
+                let delay = mint_action_retry_delay(&error);
+                last_error = Some(error.to_string());
+                if mint_action_refusal_is_final(&error) {
+                    break;
+                }
+                if retry.max_attempts.is_some_and(|limit| attempts >= limit) {
+                    break;
+                }
+                if !sleep_before_retry(delay, deadline).await {
+                    break;
+                }
+            }
         }
     }
 
@@ -370,18 +430,59 @@ async fn request_signed_mint_action(
     ))
 }
 
-fn mint_action_attempts(stage_start: u64, fire: bool, now: u64) -> usize {
-    if !fire {
-        return MINT_ACTION_RETRIES;
+async fn sleep_before_retry(delay: Duration, deadline: Option<Instant>) -> bool {
+    let sleep_for = deadline.map_or(delay, |until| {
+        until.saturating_duration_since(Instant::now()).min(delay)
+    });
+    if sleep_for.is_zero() {
+        return false;
     }
+    tokio::time::sleep(sleep_for).await;
+    deadline.is_none_or(|until| Instant::now() < until)
+}
+
+fn mint_action_retry_delay(error: &gql::GqlError) -> Duration {
+    match error {
+        gql::GqlError::Status { status: 429 } => MINT_ACTION_RATE_LIMIT_DELAY,
+        gql::GqlError::Query(message)
+            if message.to_ascii_lowercase().contains("too many requests") =>
+        {
+            MINT_ACTION_RATE_LIMIT_DELAY
+        }
+        _ => MINT_ACTION_RETRY_DELAY,
+    }
+}
+
+fn mint_action_refusal_is_final(error: &gql::GqlError) -> bool {
+    matches!(
+        error,
+        gql::GqlError::Refused(reason) if reason.contains("InsufficientMintsRemainingError")
+    )
+}
+
+fn mint_action_retry_plan(stage_start: u64, fire: bool, now: u64) -> RetryPlan {
     let deadline = stage_start.saturating_add(MINT_ACTION_OPEN_GRACE_SECONDS);
-    let wait_seconds = deadline
+    if !fire || now >= deadline {
+        return RetryPlan {
+            initial_delay: Duration::ZERO,
+            deadline_after: None,
+            max_attempts: Some(MINT_ACTION_RETRIES),
+        };
+    }
+
+    let budget_seconds = deadline
         .saturating_sub(now)
         .min(MINT_ACTION_MAX_WAIT_SECONDS);
-    usize::try_from(wait_seconds)
-        .unwrap_or(MINT_ACTION_RETRIES)
-        .saturating_add(1)
-        .max(MINT_ACTION_RETRIES)
+    let first_check = stage_start.saturating_sub(MINT_ACTION_FIRST_CHECK_SECONDS);
+    let initial_delay_seconds = first_check
+        .saturating_sub(now)
+        .min(budget_seconds.saturating_sub(1));
+
+    RetryPlan {
+        initial_delay: Duration::from_secs(initial_delay_seconds),
+        deadline_after: Some(Duration::from_secs(budget_seconds)),
+        max_attempts: None,
+    }
 }
 
 /// Signs the ready wallets before the freeze window begins.
@@ -454,29 +555,60 @@ async fn preflight_shots_through_open(
     shots: &[Shot],
     stage_start: u64,
 ) -> Result<(), String> {
-    let attempts = preflight_attempts(stage_start, now_unix());
+    let retry = preflight_retry_plan(stage_start, now_unix());
+    let deadline = retry.deadline_after.map(|after| Instant::now() + after);
     let mut last_error = None;
-    for attempt in 0..attempts {
-        match preflight_shots(rpc, shots).await {
-            Ok(()) => return Ok(()),
-            Err(error) => last_error = Some(error),
+    let mut attempts = 0_usize;
+
+    loop {
+        if retry.max_attempts.is_some_and(|limit| attempts >= limit) {
+            break;
         }
-        if attempt + 1 < attempts {
-            tokio::time::sleep(PREFLIGHT_RETRY_DELAY).await;
+        let request_timeout = deadline.map_or(PREFLIGHT_REQUEST_TIMEOUT, |until| {
+            until
+                .saturating_duration_since(Instant::now())
+                .min(PREFLIGHT_REQUEST_TIMEOUT)
+        });
+        if request_timeout.is_zero() {
+            break;
+        }
+
+        attempts = attempts.saturating_add(1);
+        match tokio::time::timeout(request_timeout, preflight_shots(rpc, shots)).await {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(error)) => last_error = Some(error),
+            Err(_) => {
+                last_error = Some(format!(
+                    "mint preflight did not answer within {} seconds",
+                    request_timeout.as_secs()
+                ));
+            }
+        }
+        if retry.max_attempts.is_some_and(|limit| attempts >= limit) {
+            break;
+        }
+        if !sleep_before_retry(PREFLIGHT_RETRY_DELAY, deadline).await {
+            break;
         }
     }
-    Err(last_error.unwrap_or_else(|| "mint preflight did not run".to_owned()))
+    Err(last_error
+        .unwrap_or_else(|| format!("mint preflight did not succeed after {attempts} attempts")))
 }
 
-fn preflight_attempts(stage_start: u64, now: u64) -> usize {
-    let wait_seconds = stage_start
-        .saturating_add(PREFLIGHT_OPEN_GRACE_SECONDS)
-        .saturating_sub(now)
-        .min(PREFLIGHT_OPEN_GRACE_SECONDS);
-    usize::try_from(wait_seconds)
-        .unwrap_or(PREFLIGHT_RETRIES)
-        .saturating_add(1)
-        .max(PREFLIGHT_RETRIES)
+fn preflight_retry_plan(stage_start: u64, now: u64) -> RetryPlan {
+    let deadline = stage_start.saturating_add(PREFLIGHT_OPEN_GRACE_SECONDS);
+    if now >= deadline {
+        return RetryPlan {
+            initial_delay: Duration::ZERO,
+            deadline_after: None,
+            max_attempts: Some(PREFLIGHT_RETRIES),
+        };
+    }
+    RetryPlan {
+        initial_delay: Duration::ZERO,
+        deadline_after: Some(Duration::from_secs(deadline.saturating_sub(now))),
+        max_attempts: None,
+    }
 }
 
 /// Sends the frozen transactions and classifies each result from chain state.
@@ -917,17 +1049,53 @@ mod tests {
     }
 
     #[test]
-    fn a_fire_run_polls_signed_actions_through_the_opening_boundary() {
-        assert_eq!(mint_action_attempts(1_000, true, 940), 91);
-        assert_eq!(mint_action_attempts(1_000, true, 1_020), 11);
-        assert_eq!(mint_action_attempts(1_000, true, 1_031), 3);
-        assert_eq!(mint_action_attempts(1_000, false, 940), 3);
+    fn a_fire_run_uses_a_real_deadline_and_waits_until_near_opening() {
+        let early = mint_action_retry_plan(1_000, true, 940);
+        assert_eq!(early.initial_delay, Duration::from_secs(55));
+        assert_eq!(early.deadline_after, Some(Duration::from_secs(90)));
+        assert_eq!(early.max_attempts, None);
+
+        let open = mint_action_retry_plan(1_000, true, 1_020);
+        assert_eq!(open.initial_delay, Duration::ZERO);
+        assert_eq!(open.deadline_after, Some(Duration::from_secs(10)));
+
+        let late = mint_action_retry_plan(1_000, true, 1_031);
+        assert_eq!(late.max_attempts, Some(3));
+        assert_eq!(
+            mint_action_retry_plan(1_000, false, 940).max_attempts,
+            Some(3)
+        );
     }
 
     #[test]
     fn preflight_absorbs_a_lagging_rpc_at_stage_open() {
-        assert_eq!(preflight_attempts(1_000, 1_000), 31);
-        assert_eq!(preflight_attempts(1_000, 1_020), 11);
-        assert_eq!(preflight_attempts(1_000, 1_031), 3);
+        assert_eq!(
+            preflight_retry_plan(1_000, 1_000).deadline_after,
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            preflight_retry_plan(1_000, 1_020).deadline_after,
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(preflight_retry_plan(1_000, 1_031).max_attempts, Some(3));
+    }
+
+    #[test]
+    fn opensea_rate_limits_get_a_slower_retry() {
+        assert_eq!(
+            mint_action_retry_delay(&gql::GqlError::Status { status: 429 }),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            mint_action_retry_delay(&gql::GqlError::Transport("reset".to_owned())),
+            Duration::from_secs(2)
+        );
+    }
+
+    #[test]
+    fn sold_out_signed_actions_stop_polling() {
+        assert!(mint_action_refusal_is_final(&gql::GqlError::Refused(
+            "InsufficientMintsRemainingError".to_owned()
+        )));
     }
 }

@@ -709,11 +709,17 @@ fn acquire_lock(path: &Path) -> Result<LockGuard, String> {
             })
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let stale = fs::metadata(path)
+            #[cfg(unix)]
+            let owner_pid = lock_owner_pid(path);
+            let old = fs::metadata(path)
                 .and_then(|metadata| metadata.modified())
                 .ok()
                 .and_then(|modified| modified.elapsed().ok())
                 .is_some_and(|age| age > Duration::from_mins(5));
+            #[cfg(unix)]
+            let stale = owner_pid.map_or(old, |pid| !nock_cron_process_is_running(pid));
+            #[cfg(not(unix))]
+            let stale = old;
             if stale {
                 fs::remove_file(path).map_err(|remove_error| {
                     format!(
@@ -733,6 +739,47 @@ fn acquire_lock(path: &Path) -> Result<LockGuard, String> {
             path.display()
         )),
     }
+}
+
+#[cfg(unix)]
+fn lock_owner_pid(path: &Path) -> Option<u32> {
+    let text = fs::read_to_string(path).ok()?;
+    text.split_ascii_whitespace()
+        .find_map(|part| part.strip_prefix("pid="))?
+        .parse()
+        .ok()
+}
+
+#[cfg(unix)]
+fn nock_cron_process_is_running(pid: u32) -> bool {
+    let process = PathBuf::from("/proc").join(pid.to_string());
+    if !process.exists() {
+        return false;
+    }
+    match fs::read(process.join("cmdline")) {
+        Ok(command) => command_line_is_nock_cron(&command),
+        // A live process can briefly be unreadable. Keeping the lock is safer
+        // than admitting a second signer for the same wallet.
+        Err(_) => true,
+    }
+}
+
+#[cfg(any(unix, test))]
+fn command_line_is_nock_cron(command: &[u8]) -> bool {
+    let arguments = command
+        .split(|byte| *byte == 0)
+        .filter(|argument| !argument.is_empty())
+        .map(String::from_utf8_lossy);
+    let mut saw_nock = false;
+    let mut saw_cron = false;
+    for argument in arguments {
+        saw_nock |= argument
+            .rsplit(['/', '\\'])
+            .next()
+            .is_some_and(|name| name == "nock");
+        saw_cron |= argument == "cron";
+    }
+    saw_nock && saw_cron
 }
 
 fn refresh_lock(path: &Path) -> Result<(), String> {
@@ -859,5 +906,12 @@ mod tests {
             }],
         };
         assert!(validate_schedule(&spec).is_err());
+    }
+
+    #[test]
+    fn recognises_the_scheduler_process_that_owns_a_lock() {
+        assert!(command_line_is_nock_cron(b"/opt/nock/nock\0cron\0--fire\0"));
+        assert!(!command_line_is_nock_cron(b"/opt/nock/nock\0mint\0"));
+        assert!(!command_line_is_nock_cron(b"/usr/bin/sleep\0cron\0"));
     }
 }

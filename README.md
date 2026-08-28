@@ -215,12 +215,17 @@ The scheduler is deliberately conservative:
   pre-window baseline
 - activity from an earlier stage is absorbed before the next safety window;
   activity inside the final window makes cron stand down
-- for signed stages, a fire run keeps asking OpenSea for the wallet-specific
-  mint action through 30 seconds after opening, covering short eligibility lag
+- for signed stages, a fire run starts asking OpenSea near T-5 and keeps trying
+  through 30 seconds after opening, covering short eligibility lag without
+  wasting the endpoint's rate limit during the whole final minute
+- those retries use a real wall-clock deadline; slow replies cannot stretch the
+  grace period, and an HTTP 429 backs off before another request
 - exact transaction simulation also retries through that opening grace period
   before any bytes are broadcast
 - a scheduled transaction is never automatically retried, because an accepted
   transaction can be real even when a receipt check is temporarily unavailable
+- after an unclean service exit, a lock owned by a dead scheduler is reclaimed;
+  a lock belonging to a live `nock cron` process is never removed
 
 This prevents the scheduler from competing with a manual mint from the same
 wallet during the race window without letting a completed earlier stage cancel
