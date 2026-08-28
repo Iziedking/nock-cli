@@ -26,6 +26,7 @@ use crate::wallet::keystore::Keystore;
 const DEFAULT_WINDOW_SECONDS: u64 = 60;
 const DEFAULT_POLL_SECONDS: u64 = 5;
 const STAGE_REFRESH_SECONDS: u64 = 15;
+const BASELINE_REFRESH_SECONDS: u64 = 60;
 
 #[derive(Debug, PartialEq, Eq)]
 enum StageWindow {
@@ -95,6 +96,8 @@ struct JobState {
     #[serde(default)]
     baseline: Vec<WalletBaseline>,
     #[serde(default)]
+    baseline_checked_at: u64,
+    #[serde(default)]
     dry_run_reported: bool,
     #[serde(default)]
     attempted: bool,
@@ -108,7 +111,7 @@ struct StageSnapshot {
     end_time: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct WalletBaseline {
     path: String,
     address: String,
@@ -193,7 +196,7 @@ async fn run_inner(config: &Config, args: CronArgs) -> Result<(), String> {
         if args.fire { "FIRE ENABLED" } else { "DRY RUN" }
     );
     if args.fire {
-        println!("Broadcasting is enabled. Each job has one attempt and will not be retried automatically.");
+        println!("Broadcasting is enabled. Each job permits one broadcast; safe pre-broadcast checks retry through opening.");
     } else {
         println!("No transaction can be broadcast in this mode. Add --fire only after reviewing the dry run.");
     }
@@ -284,6 +287,7 @@ async fn process_job(
     if !baseline_matches(&job_state.baseline, &target_paths, &target_addresses) {
         job_state.baseline =
             capture_baseline(context.config, &job.collection, &target_paths).await?;
+        job_state.baseline_checked_at = now;
         changed = true;
         println!(
             "  [{}] armed for stage {} at {}",
@@ -320,6 +324,29 @@ async fn process_job(
         StageWindow::Before => {
             let seconds_until_open = window.start_time.saturating_sub(now);
             if seconds_until_open > context.window_seconds {
+                // Wallet activity from an earlier stage must not cancel this
+                // one. Keep accepting known state until the safety window;
+                // only activity inside that window is treated as a possible
+                // manual fire that cron must not clash with.
+                let refresh_due = should_refresh_baseline(
+                    now,
+                    job_state.baseline_checked_at,
+                    seconds_until_open,
+                    context.window_seconds,
+                );
+                if refresh_due {
+                    let current =
+                        capture_baseline(context.config, &job.collection, &target_paths).await?;
+                    if current != job_state.baseline {
+                        println!(
+                            "  [{}] accepted wallet activity before the safety window",
+                            job.id
+                        );
+                        job_state.baseline = current;
+                    }
+                    job_state.baseline_checked_at = now;
+                    changed = true;
+                }
                 return Ok(changed);
             }
         }
@@ -340,7 +367,7 @@ async fn process_job(
             job.id
         );
         let collection_address = job_state.collection_address.clone().unwrap_or_default();
-        sync_related_baselines(state, &collection_address, &target_addresses, &current);
+        sync_related_baselines(state, &collection_address, &target_addresses, &current, now);
         return Ok(true);
     }
 
@@ -383,7 +410,13 @@ async fn process_job(
                     current
                 }
             };
-        sync_related_baselines(state, &collection_address, &target_addresses, &post_attempt);
+        sync_related_baselines(
+            state,
+            &collection_address,
+            &target_addresses,
+            &post_attempt,
+            now_unix(),
+        );
         println!(
             "  [{}] scheduled attempt finished; inspect the child outcome before retrying",
             job.id
@@ -523,11 +556,22 @@ fn manual_activity(before: &[WalletBaseline], after: &[WalletBaseline]) -> bool 
     })
 }
 
+fn should_refresh_baseline(
+    now: u64,
+    checked_at: u64,
+    seconds_until_open: u64,
+    window_seconds: u64,
+) -> bool {
+    now.saturating_sub(checked_at) >= BASELINE_REFRESH_SECONDS
+        || seconds_until_open <= window_seconds.saturating_mul(2)
+}
+
 fn sync_related_baselines(
     state: &mut CronState,
     collection_input: &str,
     addresses: &[String],
     current: &[WalletBaseline],
+    checked_at: u64,
 ) {
     for job in state.jobs.values_mut() {
         let same_collection = job.collection_address.as_deref() == Some(collection_input);
@@ -538,6 +582,7 @@ fn sync_related_baselines(
             .eq(addresses.iter().cloned());
         if same_collection && same_wallets {
             job.baseline = current.to_vec();
+            job.baseline_checked_at = checked_at;
         }
     }
 }
@@ -776,6 +821,13 @@ mod tests {
         after[0].pending_nonce = 4;
         after[0].nft_balance = 3;
         assert!(manual_activity(&before, &after));
+    }
+
+    #[test]
+    fn prior_stage_activity_is_absorbed_before_the_safety_window() {
+        assert!(should_refresh_baseline(120, 0, 600, 60));
+        assert!(!should_refresh_baseline(150, 120, 180, 60));
+        assert!(should_refresh_baseline(155, 150, 120, 60));
     }
 
     #[test]

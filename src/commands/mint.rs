@@ -54,6 +54,15 @@ const READY_BY_SECONDS: i64 = 30;
 /// through a closed or sold-out stage.
 const MINT_ACTION_RETRIES: usize = 3;
 const MINT_ACTION_RETRY_DELAY: Duration = Duration::from_secs(1);
+/// A signed mint action can appear only after the stage opens, even when
+/// `OpenSea` published the stage hours earlier. An armed fire run waits through
+/// that cache-settling boundary instead of spending its only attempt early.
+const MINT_ACTION_OPEN_GRACE_SECONDS: u64 = 30;
+/// A bad timestamp must not leave a command waiting without a useful bound.
+const MINT_ACTION_MAX_WAIT_SECONDS: u64 = 120;
+const PREFLIGHT_RETRIES: usize = 3;
+const PREFLIGHT_RETRY_DELAY: Duration = Duration::from_secs(1);
+const PREFLIGHT_OPEN_GRACE_SECONDS: u64 = 30;
 
 pub struct MintArgs<'a> {
     pub collection: &'a str,
@@ -138,6 +147,7 @@ async fn prepare_and_run(config: &Config, args: MintArgs<'_>) -> Result<ExitCode
                     stage,
                     slug: slug.as_deref(),
                     quantity: args.quantity,
+                    fire: args.fire,
                 },
             )
             .await,
@@ -177,6 +187,7 @@ struct PrepareInput<'a> {
     stage: Stage,
     slug: Option<&'a str>,
     quantity: u64,
+    fire: bool,
 }
 
 /// One wallet's nonce, balance, calldata and verdict.
@@ -298,6 +309,7 @@ async fn signed_calldata(
         input.collection,
         input.stage.index,
         quantity,
+        mint_action_attempts(input.stage.start_time, input.fire, now_unix()),
     )
     .await?;
 
@@ -330,30 +342,46 @@ async fn request_signed_mint_action(
     collection: Address,
     stage_index: u64,
     quantity: u64,
+    attempts: usize,
 ) -> Result<crate::chain::opensea::verify::SubmissionData, String> {
     let variables = mint_action_variables(address, collection, "robinhood", quantity);
-    let mut last_refusal = None;
+    let mut last_error = None;
 
-    for attempt in 0..MINT_ACTION_RETRIES {
-        let body = gql::post(http, MINT_ACTION, variables.clone(), Some(session))
-            .await
-            .map_err(|e| format!("could not fetch calldata: {e}"))?;
-        match gql::parse_submission(&body) {
+    for attempt in 0..attempts {
+        let result = match gql::post(http, MINT_ACTION, variables.clone(), Some(session)).await {
+            Ok(body) => gql::parse_submission(&body),
+            Err(error) => Err(error),
+        };
+        match result {
             Ok(submission) => return Ok(submission),
-            Err(gql::GqlError::Refused(reason)) => {
-                last_refusal = Some(reason);
-                if attempt + 1 < MINT_ACTION_RETRIES {
-                    tokio::time::sleep(MINT_ACTION_RETRY_DELAY).await;
-                }
+            Err(gql::GqlError::Malformed(reason)) => {
+                return Err(format!("could not fetch calldata: {reason}"));
             }
-            Err(error) => return Err(format!("could not fetch calldata: {error}")),
+            Err(error) => last_error = Some(error.to_string()),
+        }
+        if attempt + 1 < attempts {
+            tokio::time::sleep(MINT_ACTION_RETRY_DELAY).await;
         }
     }
 
     Err(format!(
-        "not eligible for stage {stage_index}; OpenSea refused the live mint action after {MINT_ACTION_RETRIES} attempts: {}",
-        last_refusal.unwrap_or_else(|| "no transaction was returned".to_owned())
+        "not eligible for stage {stage_index}; OpenSea did not return a live mint action after {attempts} attempts: {}",
+        last_error.unwrap_or_else(|| "no transaction was returned".to_owned())
     ))
+}
+
+fn mint_action_attempts(stage_start: u64, fire: bool, now: u64) -> usize {
+    if !fire {
+        return MINT_ACTION_RETRIES;
+    }
+    let deadline = stage_start.saturating_add(MINT_ACTION_OPEN_GRACE_SECONDS);
+    let wait_seconds = deadline
+        .saturating_sub(now)
+        .min(MINT_ACTION_MAX_WAIT_SECONDS);
+    usize::try_from(wait_seconds)
+        .unwrap_or(MINT_ACTION_RETRIES)
+        .saturating_add(1)
+        .max(MINT_ACTION_RETRIES)
 }
 
 /// Signs the ready wallets before the freeze window begins.
@@ -419,6 +447,36 @@ async fn preflight_shots(rpc: &mut Rpc, shots: &[Shot]) -> Result<(), String> {
             })?;
     }
     Ok(())
+}
+
+async fn preflight_shots_through_open(
+    rpc: &mut Rpc,
+    shots: &[Shot],
+    stage_start: u64,
+) -> Result<(), String> {
+    let attempts = preflight_attempts(stage_start, now_unix());
+    let mut last_error = None;
+    for attempt in 0..attempts {
+        match preflight_shots(rpc, shots).await {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+        if attempt + 1 < attempts {
+            tokio::time::sleep(PREFLIGHT_RETRY_DELAY).await;
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "mint preflight did not run".to_owned()))
+}
+
+fn preflight_attempts(stage_start: u64, now: u64) -> usize {
+    let wait_seconds = stage_start
+        .saturating_add(PREFLIGHT_OPEN_GRACE_SECONDS)
+        .saturating_sub(now)
+        .min(PREFLIGHT_OPEN_GRACE_SECONDS);
+    usize::try_from(wait_seconds)
+        .unwrap_or(PREFLIGHT_RETRIES)
+        .saturating_add(1)
+        .max(PREFLIGHT_RETRIES)
 }
 
 /// Sends the frozen transactions and classifies each result from chain state.
@@ -508,7 +566,7 @@ async fn fire_stage(
     // On Robinhood Chain a reverting mint still costs gas. A single preflight
     // refusal aborts the batch rather than letting the other wallets race into
     // a state we have not proved safe.
-    preflight_shots(&mut rpc, &shots).await?;
+    preflight_shots_through_open(&mut rpc, &shots, plan.stage.start_time).await?;
     let results = send_and_classify(config, &shots).await;
 
     drop(rpc);
@@ -856,5 +914,20 @@ mod tests {
         let missing = PathBuf::from("does-not-exist.txt");
         let err = wallet_paths(None, Some(&missing)).unwrap_err();
         assert!(err.contains("could not read"));
+    }
+
+    #[test]
+    fn a_fire_run_polls_signed_actions_through_the_opening_boundary() {
+        assert_eq!(mint_action_attempts(1_000, true, 940), 91);
+        assert_eq!(mint_action_attempts(1_000, true, 1_020), 11);
+        assert_eq!(mint_action_attempts(1_000, true, 1_031), 3);
+        assert_eq!(mint_action_attempts(1_000, false, 940), 3);
+    }
+
+    #[test]
+    fn preflight_absorbs_a_lagging_rpc_at_stage_open() {
+        assert_eq!(preflight_attempts(1_000, 1_000), 31);
+        assert_eq!(preflight_attempts(1_000, 1_020), 11);
+        assert_eq!(preflight_attempts(1_000, 1_031), 3);
     }
 }

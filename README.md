@@ -208,18 +208,24 @@ wallet are all supplied in the schedule file.
 The scheduler is deliberately conservative:
 
 - it is dry-run unless you add `--fire`
-- it only acts during the 60 seconds before a stage opens
-- it records its state and takes one scheduled attempt per job
+- it starts in the final 60 seconds, or immediately if the stage is already
+  open and has not ended
+- it records its state and permits one broadcast per job
 - before acting, it compares the wallet's pending nonce and NFT balance with a
   pre-window baseline
-- if you sent a manual transaction, the job is marked as handled and cron
-  stands down
+- activity from an earlier stage is absorbed before the next safety window;
+  activity inside the final window makes cron stand down
+- for signed stages, a fire run keeps asking OpenSea for the wallet-specific
+  mint action through 30 seconds after opening, covering short eligibility lag
+- exact transaction simulation also retries through that opening grace period
+  before any bytes are broadcast
 - a scheduled transaction is never automatically retried, because an accepted
   transaction can be real even when a receipt check is temporarily unavailable
 
 This prevents the scheduler from competing with a manual mint from the same
-wallet. Use a dedicated mint wallet; an unrelated transaction from that wallet
-also counts as manual activity and safely causes cron to stand down.
+wallet during the race window without letting a completed earlier stage cancel
+the next one. Use a dedicated mint wallet; any transaction made inside the
+final window counts as manual activity and safely causes cron to stand down.
 
 Create a schedule such as this one. The stage numbers below match the Goat
 Street drop: GTD is stage 2, FCFS is stage 3, and public is stage 0. Other
