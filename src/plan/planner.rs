@@ -19,8 +19,18 @@ use crate::chain::opensea::verify::Rejection;
 pub enum PlanStatus {
     /// Verified, affordable, and ready to sign.
     Ready { quantity: u64, cost_wei: u128 },
-    /// The stage answered that this wallet is not on the list.
+    /// The stage answered that this wallet is not on the list. An ANSWER, which
+    /// is what separates it from `Unavailable`.
     NotEligible,
+    /// Nobody ever answered. Rate limited, timed out, or unreachable, so what
+    /// this wallet is entitled to remains UNKNOWN rather than refused.
+    ///
+    /// Kept apart from `NotEligible` because collapsing the two told Izie a
+    /// Goat Street wallet was not on the allowlist when it was, and the web UI
+    /// minted with that same wallet minutes later. The eligibility field
+    /// defaults to false when absent, so silence is indistinguishable from a
+    /// refusal on the wire unless it is carried separately.
+    Unavailable { why: String },
     /// Nothing left to mint. `SeaDrop` reverts on this, and a revert costs the gas
     /// of a transaction that was never going to work, so it is caught here.
     SoldOut { left: u64, wanted: u64 },
@@ -48,6 +58,7 @@ impl PlanStatus {
         match self {
             Self::Ready { .. } => "ready",
             Self::NotEligible => "not eligible",
+            Self::Unavailable { .. } => "unavailable",
             Self::SoldOut { .. } => "sold out",
             Self::Refused(_) => "refused",
             Self::Underfunded { .. } => "underfunded",
@@ -97,6 +108,9 @@ pub struct Candidate {
     /// What this wallet may mint here, already clamped by the caller against the
     /// stage cap and whatever the user asked for.
     pub quantity: u64,
+    /// Set when the stage could not be asked at all. Carries the reason so the
+    /// report can say which service failed rather than blaming the wallet.
+    pub unavailable: Option<String>,
     /// Verification's verdict on this wallet's calldata, if it got that far.
     pub refusal: Option<Rejection>,
     pub balance_wei: u128,
@@ -133,6 +147,12 @@ fn plan_one(stage: Stage, candidate: &Candidate, ceiling: &mut SpendCeiling) -> 
     // wallet we would never have signed for would be a lie about the reason.
     if let Some(refusal) = candidate.refusal.clone() {
         return PlanStatus::Refused(refusal);
+    }
+    // Ahead of the eligibility flag on purpose. That flag reads false both when
+    // the stage said no and when nothing was ever returned, so the recorded
+    // reason for the silence is the more truthful of the two and wins.
+    if let Some(why) = candidate.unavailable.clone() {
+        return PlanStatus::Unavailable { why };
     }
     if !candidate.eligible {
         return PlanStatus::NotEligible;
@@ -204,6 +224,7 @@ mod tests {
             address: Address::repeat_byte(u8::try_from(index + 1).unwrap()),
             eligible: true,
             quantity: 1,
+            unavailable: None,
             refusal: None,
             balance_wei: ETH,
             gas_ceiling_wei: GAS,
@@ -249,6 +270,38 @@ mod tests {
         assert!(matches!(
             plan.wallets[3].status,
             PlanStatus::DroppedForSpend { .. }
+        ));
+    }
+
+    // THE GOAT STREET LESSON, 2026-08-28. OpenSea rate limited the CLI, every
+    // failure collapsed into "not eligible", and the wallet was reported as not
+    // on the allowlist. It was on the allowlist: the web UI minted with it
+    // minutes later. Not knowing and being told no are different answers and the
+    // report may never merge them.
+    #[test]
+    fn an_unanswered_wallet_is_not_reported_as_ineligible() {
+        let mut candidates: Vec<_> = (0..2).map(candidate).collect();
+        candidates[0].unavailable = Some("OpenSea answered 429".to_owned());
+        let plan = build_plan(stage(0), &candidates, &mut SpendCeiling::new(0));
+        match plan.wallets[0].status {
+            PlanStatus::Unavailable { ref why } => assert!(why.contains("429")),
+            ref other => panic!("expected unavailable, got {other:?}"),
+        }
+        assert!(plan.wallets[1].status.is_ready());
+    }
+
+    // A wallet OpenSea never answered for reads as ineligible on the wire,
+    // because the eligibility field defaults to false when it is absent. The
+    // silence is the more truthful of the two facts, so it wins.
+    #[test]
+    fn not_knowing_outranks_a_defaulted_ineligibility() {
+        let mut candidates: Vec<_> = (0..1).map(candidate).collect();
+        candidates[0].eligible = false;
+        candidates[0].unavailable = Some("OpenSea did not answer".to_owned());
+        let plan = build_plan(stage(0), &candidates, &mut SpendCeiling::new(0));
+        assert!(matches!(
+            plan.wallets[0].status,
+            PlanStatus::Unavailable { .. }
         ));
     }
 
@@ -354,11 +407,15 @@ mod tests {
     // enum variants.
     #[test]
     fn every_status_has_a_label_for_the_report() {
-        let mut candidates: Vec<_> = (0..3).map(candidate).collect();
+        let mut candidates: Vec<_> = (0..4).map(candidate).collect();
         candidates[0].eligible = false;
         candidates[1].balance_wei = 0;
+        candidates[3].unavailable = Some("OpenSea answered 429".to_owned());
         let plan = build_plan(stage(ETH / 100), &candidates, &mut SpendCeiling::new(ETH));
         let labels: Vec<_> = plan.wallets.iter().map(|w| w.status.label()).collect();
-        assert_eq!(labels, vec!["not eligible", "underfunded", "ready"]);
+        assert_eq!(
+            labels,
+            vec!["not eligible", "underfunded", "ready", "unavailable"]
+        );
     }
 }

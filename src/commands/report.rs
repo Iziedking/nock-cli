@@ -33,6 +33,12 @@ fn detail(status: &PlanStatus) -> String {
     match status {
         PlanStatus::Ready { .. } => "ready".to_owned(),
         PlanStatus::NotEligible => "not eligible for this stage".to_owned(),
+        // Deliberately does NOT say "not eligible". Nobody answered, so what
+        // this wallet may mint is unknown, and the sentence has to send the
+        // reader at the service rather than at their own allowlist spot.
+        PlanStatus::Unavailable { why } => {
+            format!("could not be checked: {why}. Eligibility is unknown, not refused")
+        }
         PlanStatus::SoldOut { left, wanted } => {
             format!("sold out: {left} left and {wanted} wanted")
         }

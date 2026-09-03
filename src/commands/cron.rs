@@ -26,6 +26,10 @@ use crate::wallet::keystore::Keystore;
 const DEFAULT_WINDOW_SECONDS: u64 = 60;
 const DEFAULT_POLL_SECONDS: u64 = 5;
 const STAGE_REFRESH_SECONDS: u64 = 15;
+/// First cooldown after a failed stage lookup, doubling per consecutive failure.
+const STAGE_RETRY_BASE_BACKOFF_SECONDS: u64 = 5;
+/// Ceiling on that cooldown, so a long outage still retries once a minute.
+const STAGE_RETRY_MAX_BACKOFF_SECONDS: u64 = 60;
 const BASELINE_REFRESH_SECONDS: u64 = 60;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -91,6 +95,13 @@ struct JobState {
     stage: Option<StageSnapshot>,
     #[serde(default)]
     checked_at: u64,
+    /// Consecutive failed stage lookups, and when the last one happened. Kept
+    /// in the state file so a restart does not reset the cooldown and resume
+    /// hammering an endpoint that is already refusing us.
+    #[serde(default)]
+    stage_failures: u32,
+    #[serde(default)]
+    stage_failed_at: u64,
     #[serde(default)]
     collection_address: Option<String>,
     #[serde(default)]
@@ -234,6 +245,32 @@ async fn run_inner(config: &Config, args: CronArgs) -> Result<(), String> {
     Ok(())
 }
 
+/// Resolves the collection and the stage this job is waiting for.
+///
+/// Pulled out of `process_job` so its failure is a value the caller decides
+/// about rather than a `?` that ends the whole scheduler run.
+async fn lookup_stage(
+    context: &CronContext<'_>,
+    job: &CronJob,
+) -> Result<(Address, StageSnapshot), String> {
+    let (collection, slug) = resolve_collection(context.http, &job.collection).await?;
+    let (selected_stage, _) = choose_stage(
+        &mut Rpc::new(context.config.rpc_urls.clone(), Duration::from_secs(10)),
+        context.http,
+        collection,
+        Some(job.stage),
+        slug,
+    )
+    .await?;
+    Ok((
+        collection,
+        StageSnapshot {
+            start_time: selected_stage.start_time,
+            end_time: selected_stage.end_time,
+        },
+    ))
+}
+
 #[allow(clippy::too_many_lines)]
 async fn process_job(
     context: &CronContext<'_>,
@@ -252,38 +289,58 @@ async fn process_job(
         };
     }
 
-    let stage_refreshed = !(job_state.stage.is_some()
-        && now.saturating_sub(job_state.checked_at) < STAGE_REFRESH_SECONDS);
-    let window = if stage_refreshed {
-        let (collection, slug) = resolve_collection(context.http, &job.collection).await?;
-        let (selected_stage, _) = choose_stage(
-            &mut Rpc::new(context.config.rpc_urls.clone(), Duration::from_secs(10)),
-            context.http,
-            collection,
-            Some(job.stage),
-            slug,
-        )
-        .await?;
-        job_state.collection_address = Some(format!("{collection:?}"));
-        job_state.checked_at = now;
-        let snapshot = StageSnapshot {
-            start_time: selected_stage.start_time,
-            end_time: selected_stage.end_time,
-        };
-        job_state.stage = Some(snapshot.clone());
-        snapshot
-    } else {
-        let cached = job_state
-            .stage
-            .as_ref()
-            .ok_or_else(|| "cron stage cache disappeared".to_owned())?;
-        StageSnapshot {
+    // Two brakes, not one. The 15 second cache stops needless lookups; the
+    // post-failure cooldown stops a fast poll turning one OpenSea 429 into a
+    // sustained hammering that guarantees the next one.
+    let stage_due = stage_refresh_is_due(
+        now,
+        job_state.stage.is_some(),
+        job_state.checked_at,
+        job_state.stage_failures,
+        job_state.stage_failed_at,
+    );
+    let mut changed = false;
+    if stage_due {
+        match lookup_stage(context, job).await {
+            Ok((collection, snapshot)) => {
+                job_state.collection_address = Some(format!("{collection:?}"));
+                job_state.checked_at = now;
+                job_state.stage_failures = 0;
+                job_state.stage_failed_at = 0;
+                job_state.stage = Some(snapshot);
+                changed = true;
+            }
+            Err(why) => {
+                // A transient OpenSea or RPC failure must NOT end the run. The
+                // scheduler exists to be alive at T-0, and dying on the first
+                // 429 is the one outcome that guarantees it is not. The counter
+                // and the timestamp are persisted, so the cooldown survives a
+                // restart rather than resetting into another burst.
+                job_state.stage_failures = job_state.stage_failures.saturating_add(1);
+                job_state.stage_failed_at = now;
+                let wait = stage_retry_backoff_seconds(job_state.stage_failures);
+                eprintln!(
+                    "  [{}] could not read the stage ({why}); next attempt in {wait}s",
+                    job.id
+                );
+                // With no cached stage there is nothing to act on this pass.
+                if job_state.stage.is_none() {
+                    return Ok(true);
+                }
+                changed = true;
+            }
+        }
+    }
+
+    let window = job_state
+        .stage
+        .as_ref()
+        .map(|cached| StageSnapshot {
             start_time: cached.start_time,
             end_time: cached.end_time,
-        }
-    };
+        })
+        .ok_or_else(|| "cron stage cache disappeared".to_owned())?;
 
-    let mut changed = stage_refreshed;
     if !baseline_matches(&job_state.baseline, &target_paths, &target_addresses) {
         job_state.baseline =
             capture_baseline(context.config, &job.collection, &target_paths).await?;
@@ -554,6 +611,45 @@ fn manual_activity(before: &[WalletBaseline], after: &[WalletBaseline]) -> bool 
                 current.pending_nonce > old.pending_nonce || current.nft_balance > old.nft_balance
             })
     })
+}
+
+/// How long to leave `OpenSea` alone after a failed stage lookup.
+///
+/// Doubles per consecutive failure and then holds at a minute. A one-second
+/// poll is a REASONABLE choice for a public stage, which asks `OpenSea` for
+/// nothing at all, so the fix for rate limiting belongs on the failure path and
+/// not on the interval the user chose.
+const fn stage_retry_backoff_seconds(failures: u32) -> u64 {
+    if failures == 0 {
+        return 0;
+    }
+    let raw = failures.saturating_sub(1);
+    let shift = if raw > 6 { 6 } else { raw };
+    let backoff = STAGE_RETRY_BASE_BACKOFF_SECONDS << shift;
+    if backoff > STAGE_RETRY_MAX_BACKOFF_SECONDS {
+        STAGE_RETRY_MAX_BACKOFF_SECONDS
+    } else {
+        backoff
+    }
+}
+
+/// Whether to ask `OpenSea` about this job's stage on this pass.
+///
+/// Two independent brakes. The ordinary one is the 15 second cache. The other
+/// is the post-failure cooldown, which applies EVEN WITH NO CACHED STAGE:
+/// re-asking immediately after a 429 is what spent the rate limit on Goat
+/// Street and left nothing for the mint action.
+const fn stage_refresh_is_due(
+    now: u64,
+    stage_known: bool,
+    checked_at: u64,
+    failures: u32,
+    failed_at: u64,
+) -> bool {
+    if now.saturating_sub(failed_at) < stage_retry_backoff_seconds(failures) {
+        return false;
+    }
+    !(stage_known && now.saturating_sub(checked_at) < STAGE_REFRESH_SECONDS)
 }
 
 fn should_refresh_baseline(
@@ -868,6 +964,43 @@ mod tests {
         after[0].pending_nonce = 4;
         after[0].nft_balance = 3;
         assert!(manual_activity(&before, &after));
+    }
+
+    // GOAT STREET, 2026-08-28. The FCFS attempt made 87 one-second OpenSea
+    // polls, earned an HTTP 429, and never got the mint action back before the
+    // stage opened. A one-second poll is a legitimate choice for a PUBLIC stage,
+    // which asks OpenSea for nothing, so the cure is a cooldown after a failure
+    // rather than a floor on the interval.
+    #[test]
+    fn a_failed_stage_lookup_backs_off_instead_of_polling_at_full_rate() {
+        // No failures: the ordinary 15 second cache applies.
+        assert!(!stage_refresh_is_due(1_000, true, 995, 0, 0));
+        assert!(stage_refresh_is_due(1_020, true, 995, 0, 0));
+
+        // One failure a second ago: held off even though the loop wants to poll.
+        assert!(!stage_refresh_is_due(1_001, true, 900, 1, 1_000));
+        // ... and released once the backoff has elapsed.
+        assert!(stage_refresh_is_due(1_006, true, 900, 1, 1_000));
+    }
+
+    #[test]
+    fn the_backoff_grows_with_consecutive_failures_and_is_capped() {
+        assert_eq!(stage_retry_backoff_seconds(1), 5);
+        assert_eq!(stage_retry_backoff_seconds(2), 10);
+        assert_eq!(stage_retry_backoff_seconds(3), 20);
+        assert_eq!(stage_retry_backoff_seconds(4), 40);
+        // Capped, so a long outage still retries once a minute rather than
+        // drifting into never asking again.
+        assert_eq!(stage_retry_backoff_seconds(5), 60);
+        assert_eq!(stage_retry_backoff_seconds(99), 60);
+    }
+
+    // Without a cached stage there is nothing to fall back on, so the cooldown
+    // still applies: asking again immediately is what caused the rate limit.
+    #[test]
+    fn a_first_lookup_that_failed_is_also_held_off() {
+        assert!(!stage_refresh_is_due(1_002, false, 0, 1, 1_000));
+        assert!(stage_refresh_is_due(1_010, false, 0, 1, 1_000));
     }
 
     #[test]

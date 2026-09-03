@@ -224,6 +224,7 @@ async fn prepare_wallet(
         address,
         eligible: true,
         quantity,
+        unavailable: None,
         refusal: None,
         balance_wei: balance,
         gas_ceiling_wei,
@@ -236,11 +237,16 @@ async fn prepare_wallet(
                 candidate.refusal = refusal;
                 (data, value)
             }
-            Err(why) => {
-                // Not eligible is the ordinary answer here, so it is reported as
-                // that rather than as a failure of ours.
-                candidate.eligible = false;
-                println!("  wallet {}: {why}", input.entry.index);
+            Err(failure) => {
+                // A verdict and a silence get different homes. Only the first
+                // is allowed to say anything about this wallet's entitlement.
+                match &failure {
+                    CalldataFailure::Refused(_) => candidate.eligible = false,
+                    CalldataFailure::Unavailable(why) => {
+                        candidate.unavailable = Some(why.clone());
+                    }
+                }
+                println!("  wallet {}: {}", input.entry.index, failure.why());
                 (Vec::new(), 0)
             }
         }
@@ -267,6 +273,40 @@ async fn prepare_wallet(
     }
 }
 
+/// Why a signed stage produced no calldata, and whether that is a verdict.
+///
+/// THE WHOLE POINT IS THE DISTINCTION. `Refused` is `OpenSea` understanding the
+/// question and answering that this mint cannot happen, which is final and is
+/// about the wallet. `Unavailable` is the ABSENCE of an answer -- rate limited,
+/// timed out, unreachable -- which says nothing whatever about the wallet.
+///
+/// Collapsing the two into one string is what reported a Goat Street wallet as
+/// "not on the list" on 2026-08-28 after `OpenSea` rate limited the CLI. The
+/// wallet was on the list and the web UI minted with it minutes later, so the
+/// report sent Izie to check his allowlist spot when the fault was ours.
+enum CalldataFailure {
+    Refused(String),
+    Unavailable(String),
+}
+
+impl CalldataFailure {
+    fn why(&self) -> &str {
+        match self {
+            Self::Refused(why) | Self::Unavailable(why) => why,
+        }
+    }
+}
+
+/// True only when `OpenSea` understood the question and answered it.
+///
+/// Everything else -- transport, 429, a timeout, a changed schema -- is silence,
+/// and silence must never be reported as ineligibility. Erring this way is the
+/// safe direction: calling a real refusal "unknown" costs a line of report,
+/// while calling silence a refusal costs the mint and blames the user.
+const fn is_an_answer(error: &gql::GqlError) -> bool {
+    matches!(error, gql::GqlError::Refused(_))
+}
+
 /// Calldata for a signed stage, which is the only thing `OpenSea` is asked for.
 ///
 /// Returns the calldata, its value, and a refusal if verification found one. A
@@ -276,14 +316,16 @@ async fn signed_calldata(
     input: &PrepareInput<'_>,
     address: Address,
     quantity: u64,
-) -> Result<(Vec<u8>, u128, Option<Rejection>), String> {
+) -> Result<(Vec<u8>, u128, Option<Rejection>), CalldataFailure> {
     let slug = input.slug.ok_or_else(|| {
-        "this collection is not on OpenSea, so a signed stage cannot be minted here".to_owned()
+        CalldataFailure::Unavailable(
+            "this collection is not on OpenSea, so a signed stage cannot be minted here".to_owned(),
+        )
     })?;
 
     let session: Session = authenticate(http, address, &input.entry.secret, 4663)
         .await
-        .map_err(|e| format!("could not sign in to OpenSea: {e}"))?;
+        .map_err(|e| CalldataFailure::Unavailable(format!("could not sign in to OpenSea: {e}")))?;
 
     let body = gql::post(
         http,
@@ -292,18 +334,18 @@ async fn signed_calldata(
         Some(&session),
     )
     .await
-    .map_err(|e| format!("could not read eligibility: {e}"))?;
+    .map_err(|e| CalldataFailure::Unavailable(format!("could not read eligibility: {e}")))?;
 
-    let eligibility =
-        gql::parse_eligibility(&body).map_err(|e| format!("could not read eligibility: {e}"))?;
+    let eligibility = gql::parse_eligibility(&body)
+        .map_err(|e| CalldataFailure::Unavailable(format!("could not read eligibility: {e}")))?;
     let mine = eligibility
         .iter()
         .find(|e| e.stage_index == input.stage.index)
         .ok_or_else(|| {
-            format!(
+            CalldataFailure::Unavailable(format!(
                 "stage {} was not in the eligibility answer",
                 input.stage.index
-            )
+            ))
         })?;
     if !mine.is_eligible {
         // This is not enough to stop. The web UI can show the same wallet as
@@ -357,9 +399,10 @@ async fn request_signed_mint_action(
     stage_index: u64,
     quantity: u64,
     retry: RetryPlan,
-) -> Result<crate::chain::opensea::verify::SubmissionData, String> {
+) -> Result<crate::chain::opensea::verify::SubmissionData, CalldataFailure> {
     let variables = mint_action_variables(address, collection, "robinhood", quantity);
     let mut last_error = None;
+    let mut last_error_was_an_answer = false;
     let mut attempts = 0_usize;
     let deadline = retry.deadline_after.map(|after| Instant::now() + after);
 
@@ -406,11 +449,14 @@ async fn request_signed_mint_action(
         match result {
             Ok(submission) => return Ok(submission),
             Err(gql::GqlError::Malformed(reason)) => {
-                return Err(format!("could not fetch calldata: {reason}"));
+                return Err(CalldataFailure::Unavailable(format!(
+                    "could not read what OpenSea returned: {reason}"
+                )));
             }
             Err(error) => {
                 let delay = mint_action_retry_delay(&error);
                 last_error = Some(error.to_string());
+                last_error_was_an_answer = is_an_answer(&error);
                 if mint_action_refusal_is_final(&error) {
                     break;
                 }
@@ -424,10 +470,17 @@ async fn request_signed_mint_action(
         }
     }
 
-    Err(format!(
-        "not eligible for stage {stage_index}; OpenSea did not return a live mint action after {attempts} attempts: {}",
-        last_error.unwrap_or_else(|| "no transaction was returned".to_owned())
-    ))
+    // The distinction the Goat Street failure turned on. A refusal is OpenSea
+    // answering; anything else is OpenSea not answering, and only the first of
+    // those says a single thing about whether this wallet is on the list.
+    let why = last_error.unwrap_or_else(|| "no transaction was returned".to_owned());
+    Err(if last_error_was_an_answer {
+        CalldataFailure::Refused(format!("stage {stage_index}: {why}"))
+    } else {
+        CalldataFailure::Unavailable(format!(
+            "OpenSea returned no mint action for stage {stage_index} after {attempts} attempt(s): {why}"
+        ))
+    })
 }
 
 async fn sleep_before_retry(delay: Duration, deadline: Option<Instant>) -> bool {
@@ -1078,6 +1131,30 @@ mod tests {
             Some(Duration::from_secs(10))
         );
         assert_eq!(preflight_retry_plan(1_000, 1_031).max_attempts, Some(3));
+    }
+
+    // The Goat Street rule. Only a refusal is an answer; a 429, a dropped
+    // connection or a timeout is silence, and silence may not be reported as
+    // "not on the list" because that sends the user to check their own
+    // allowlist spot for a fault that is ours.
+    #[test]
+    fn only_an_opensea_refusal_counts_as_an_answer() {
+        assert!(is_an_answer(&gql::GqlError::Refused(
+            "InsufficientMintsRemainingError".to_owned()
+        )));
+        assert!(!is_an_answer(&gql::GqlError::Status { status: 429 }));
+        assert!(!is_an_answer(&gql::GqlError::Status { status: 503 }));
+        assert!(!is_an_answer(&gql::GqlError::Transport("reset".to_owned())));
+        assert!(!is_an_answer(&gql::GqlError::Query(
+            "Too Many Requests".to_owned()
+        )));
+        assert!(!is_an_answer(&gql::GqlError::Missing("actions")));
+    }
+
+    #[test]
+    fn a_calldata_failure_reports_its_reason_whichever_kind_it_is() {
+        assert_eq!(CalldataFailure::Refused("no".to_owned()).why(), "no");
+        assert_eq!(CalldataFailure::Unavailable("429".to_owned()).why(), "429");
     }
 
     #[test]
