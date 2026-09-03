@@ -1,6 +1,6 @@
 {
   "name": "nock-cli",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Install the Nock coding-agent skill for Claude, Codex, Cursor, Windsurf, and custom agents.",
   "type": "module",
   "license": "MIT",

@@ -220,6 +220,12 @@ The scheduler is deliberately conservative:
   wasting the endpoint's rate limit during the whole final minute
 - those retries use a real wall-clock deadline; slow replies cannot stretch the
   grace period, and an HTTP 429 backs off before another request
+- a failed stage lookup earns a growing cooldown, five seconds then doubling to
+  a minute, remembered across restarts. A fast `--interval` therefore cannot
+  turn one rate limit into the sustained polling that guarantees the next one
+- a transient OpenSea or RPC failure no longer ends the run. The job keeps its
+  last known stage, says what failed and when it will try again, and the other
+  jobs in the schedule are unaffected
 - exact transaction simulation also retries through that opening grace period
   before any bytes are broadcast
 - a scheduled transaction is never automatically retried, because an accepted
@@ -412,11 +418,24 @@ dropped.
 
 Signing in costs one signature. It proves you own the address and moves nothing.
 
+Being told no and not being able to ask are reported separately. OpenSea's
+eligibility view can lag the mint action its own UI uses, so an unsettled
+answer is not treated as final: the live mint action is the stronger check and
+is tried anyway. If that cannot be reached either, the wallet is reported as
+`unavailable` rather than as not on the list.
+
 ## Reading the output
 
 Before firing, every wallet gets a line with its status: `ready`,
-`not eligible`, `underfunded`, `sold out`, `refused` or `dropped for spend`, with
-the arithmetic behind it.
+`not eligible`, `unavailable`, `underfunded`, `sold out`, `refused` or
+`dropped for spend`, with the arithmetic behind it.
+
+`not eligible` and `unavailable` are different answers on purpose, and the
+difference matters more than it looks. `not eligible` means the stage was asked
+and said no. `unavailable` means it could not be asked at all — rate limited,
+timed out or unreachable — so what your wallet is entitled to is **unknown,
+not refused**. Only the first of those is about your wallet. On `unavailable`,
+check the service and try again; do not go looking at your allowlist spot.
 
 After firing, every wallet gets one of four outcomes and no fifth:
 

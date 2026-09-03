@@ -283,7 +283,8 @@ async fn prepare_wallet(
 /// Collapsing the two into one string is what reported a Goat Street wallet as
 /// "not on the list" on 2026-08-28 after `OpenSea` rate limited the CLI. The
 /// wallet was on the list and the web UI minted with it minutes later, so the
-/// report sent Izie to check his allowlist spot when the fault was ours.
+/// report sent its operator to check an allowlist spot that was never the
+/// problem.
 enum CalldataFailure {
     Refused(String),
     Unavailable(String),

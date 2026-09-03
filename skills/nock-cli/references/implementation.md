@@ -43,6 +43,15 @@ Preserve these invariants in code and tests:
   receipt and recipient transfer before reporting `minted`.
 - A keystore passphrase is interactive input only. Never accept raw key material
   through command-line arguments or environment variables.
+- An UNANSWERED eligibility question must never be reported as ineligibility.
+  A third-party refusal and a third-party outage are separate states with
+  separate labels, because collapsing them tells a user their allowlist spot is
+  the problem when the outage is ours. Only an explicit refusal from the
+  provider may set a wallet ineligible; rate limits, timeouts, transport errors
+  and schema changes are `unavailable`.
+- A scheduler must not let one job's transient failure end the run, and must
+  back off after a failed provider lookup so a fast poll cannot convert one
+  rate limit into sustained polling.
 
 ## Test matrix
 
@@ -52,7 +61,9 @@ For a planner or calldata change, cover:
 2. Stage selection across open, future, ended, and unsupported stages.
 3. Price, quantity, supply, wallet-balance, and spend-cap refusals.
 4. Wrong collection, recipient, fee recipient, selector, or calldata shape.
-5. OpenSea ambiguity, missing response, signed-stage mismatch, and stale SIWE.
+5. OpenSea ambiguity, missing response, signed-stage mismatch, and stale SIWE,
+   including that a rate limit or timeout reports `unavailable` and never
+   `not eligible`.
 6. RPC failover, malformed JSON-RPC, returned-hash mismatch, timeout, and
    confirmation without a receipt.
 7. Wallet encryption, wrong passphrase, missing file, ordered wallet sets, and

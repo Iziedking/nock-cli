@@ -25,9 +25,10 @@ pub enum PlanStatus {
     /// Nobody ever answered. Rate limited, timed out, or unreachable, so what
     /// this wallet is entitled to remains UNKNOWN rather than refused.
     ///
-    /// Kept apart from `NotEligible` because collapsing the two told Izie a
-    /// Goat Street wallet was not on the allowlist when it was, and the web UI
-    /// minted with that same wallet minutes later. The eligibility field
+    /// Kept apart from `NotEligible` because collapsing the two reported a
+    /// Goat Street wallet as not on the allowlist on 2026-08-28 when it was on
+    /// it, and the web UI minted with that same wallet minutes later. The
+    /// eligibility field
     /// defaults to false when absent, so silence is indistinguishable from a
     /// refusal on the wire unless it is carried separately.
     Unavailable { why: String },
