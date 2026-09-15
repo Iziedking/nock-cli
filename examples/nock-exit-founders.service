@@ -1,0 +1,20 @@
+[Unit]
+Description=Nock NFT mint scheduler
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/var/lib/nock
+EnvironmentFile=/etc/nock/nock.env
+ExecStart=/opt/nock/nock-exit-founders cron --schedule /etc/nock/exit-founders-gtd.json --passphrase-file /etc/nock/goat2.pass --fire
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/nock
+
+[Install]
+WantedBy=multi-user.target
