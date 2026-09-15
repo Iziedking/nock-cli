@@ -1,14 +1,30 @@
 {
   "poll_seconds": 5,
   "window_seconds": 60,
-  "state_file": "/var/lib/nock/exit-founders-cron.json",
+  "state_file": "/var/lib/nock/exit-founders-grachi-cron.json",
   "jobs": [
     {
       "id": "exit-founders-gtd",
       "collection": "0x1f7db5025a0d1c7a5fa56c0fd0f57a077da01573",
       "stage": 2,
       "quantity": 1,
-      "wallet": "/var/lib/nock/wallets/goat2.json",
+      "wallet": "/var/lib/nock/wallets/grachi.json",
+      "max_spend": "0"
+    },
+    {
+      "id": "exit-founders-fcfs",
+      "collection": "0x1f7db5025a0d1c7a5fa56c0fd0f57a077da01573",
+      "stage": 3,
+      "quantity": 1,
+      "wallet": "/var/lib/nock/wallets/grachi.json",
+      "max_spend": "0"
+    },
+    {
+      "id": "exit-founders-public",
+      "collection": "0x1f7db5025a0d1c7a5fa56c0fd0f57a077da01573",
+      "stage": 0,
+      "quantity": 1,
+      "wallet": "/var/lib/nock/wallets/grachi.json",
       "max_spend": "0"
     }
   ]
