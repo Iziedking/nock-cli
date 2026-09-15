@@ -112,6 +112,11 @@ struct JobState {
     dry_run_reported: bool,
     #[serde(default)]
     attempted: bool,
+    /// Cooldown after a child failed before any broadcast attempt.
+    #[serde(default)]
+    retry_after: u64,
+    #[serde(default)]
+    prebroadcast_failures: u32,
     #[serde(default)]
     last_action: Option<String>,
 }
@@ -374,7 +379,10 @@ async fn process_job(
         }
     }
 
-    if job_state.attempted || (!context.fire && job_state.dry_run_reported) {
+    if job_state.attempted
+        || now < job_state.retry_after
+        || (!context.fire && job_state.dry_run_reported)
+    {
         return Ok(changed);
     }
 
@@ -443,7 +451,17 @@ async fn process_job(
     let passphrase = context.passphrase.ok_or_else(|| {
         "cron needs --passphrase-file (or an interactive terminal) to unlock the scheduled wallet".to_owned()
     })?;
+    let marker = broadcast_marker_path(context.state_path, &job.id);
     if context.fire {
+        if !marker_absent(&marker)? {
+            job_state.attempted = true;
+            job_state.last_action = Some("prior_broadcast_intent_detected".to_owned());
+            println!(
+                "  [{}] prior broadcast intent exists; refusing a duplicate",
+                job.id
+            );
+            return Ok(true);
+        }
         // Persist before starting the child. If the process dies after the
         // transaction is accepted, a restart must not send a second one.
         job_state.attempted = true;
@@ -451,7 +469,15 @@ async fn process_job(
         let _ = job_state;
         write_state(context.state_path, state)?;
     }
-    let child = run_mint_child(context.base, job, &target_paths, context.fire, passphrase).await?;
+    let child = run_mint_child(
+        context.base,
+        job,
+        &target_paths,
+        context.fire,
+        context.fire.then_some(marker.as_path()),
+        passphrase,
+    )
+    .await?;
     if !child.stdout.trim().is_empty() {
         print!("{}", child.stdout);
     }
@@ -468,17 +494,34 @@ async fn process_job(
             .ok_or_else(|| format!("cron job {} disappeared from state", job.id))?;
         job_state.last_action = Some(format!("fire_exit_{:?}", child.status));
         let collection_address = job_state.collection_address.clone().unwrap_or_default();
-        let post_attempt =
-            match capture_baseline(context.config, &job.collection, &target_paths).await {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    eprintln!(
-                        "  [{}] could not refresh the post-attempt nonce baseline: {error}",
-                        job.id
-                    );
-                    current
-                }
-            };
+        let post_result = capture_baseline(context.config, &job.collection, &target_paths).await;
+        let post_attempt = match &post_result {
+            Ok(snapshot) => snapshot.clone(),
+            Err(error) => {
+                eprintln!(
+                    "  [{}] could not refresh the post-attempt nonce baseline: {error}",
+                    job.id
+                );
+                current.clone()
+            }
+        };
+        let safe_retry = safe_prebroadcast_retry(
+            marker_absent(&marker)?,
+            &current,
+            post_result.as_ref().ok().map(Vec::as_slice),
+        );
+        if safe_retry {
+            job_state.attempted = false;
+            job_state.prebroadcast_failures = job_state.prebroadcast_failures.saturating_add(1);
+            job_state.retry_after = now_unix().saturating_add(prebroadcast_backoff_seconds(
+                job_state.prebroadcast_failures,
+            ));
+            job_state.last_action = Some("prebroadcast_retry_armed".to_owned());
+            println!(
+                "  [{}] child did not reach broadcast and wallet state is unchanged; retrying after cooldown",
+                job.id
+            );
+        }
         sync_related_baselines(
             state,
             &collection_address,
@@ -486,10 +529,12 @@ async fn process_job(
             &post_attempt,
             now_unix(),
         );
-        println!(
-            "  [{}] scheduled attempt finished; inspect the child outcome before retrying",
-            job.id
-        );
+        if !safe_retry {
+            println!(
+                "  [{}] broadcast may have begun; automatic retry is disabled",
+                job.id
+            );
+        }
     } else {
         let job_state = state
             .jobs
@@ -510,6 +555,7 @@ async fn run_mint_child(
     job: &CronJob,
     target_paths: &[PathBuf],
     fire: bool,
+    marker: Option<&Path>,
     passphrase: &Zeroizing<String>,
 ) -> Result<ChildResult, String> {
     let executable = std::env::current_exe()
@@ -537,6 +583,9 @@ async fn run_mint_child(
     }
     if fire {
         command.arg("--fire");
+        if let Some(path) = marker {
+            command.arg("--broadcast-intent-file").arg(path);
+        }
     }
     let mut child = command
         .stdin(Stdio::piped())
@@ -725,6 +774,39 @@ fn job_fingerprint(job: &CronJob, paths: &[PathBuf]) -> String {
         job.max_spend.as_deref().unwrap_or(""),
         wallets
     )
+}
+
+fn broadcast_marker_path(state_path: &Path, job_id: &str) -> PathBuf {
+    PathBuf::from(format!(
+        "{}.broadcast-{}",
+        state_path.display(),
+        hex::encode(job_id.as_bytes())
+    ))
+}
+
+fn marker_absent(path: &Path) -> Result<bool, String> {
+    match std::fs::metadata(path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(format!(
+            "cannot safely inspect broadcast-intent marker {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn safe_prebroadcast_retry(
+    marker_missing: bool,
+    before: &[WalletBaseline],
+    after: Option<&[WalletBaseline]>,
+) -> bool {
+    marker_missing && after.is_some_and(|snapshot| snapshot == before)
+}
+
+fn prebroadcast_backoff_seconds(failures: u32) -> u64 {
+    5_u64
+        .saturating_mul(1_u64 << failures.saturating_sub(1).min(6))
+        .min(300)
 }
 
 fn wallet_addresses(paths: &[PathBuf]) -> Result<Vec<String>, String> {
@@ -960,6 +1042,48 @@ const fn one() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn existing_production_state_defaults_new_retry_fields() {
+        let state: JobState = serde_json::from_str("{\"attempted\":false}").unwrap();
+        assert!(!state.attempted);
+        assert_eq!(state.retry_after, 0);
+        assert_eq!(state.prebroadcast_failures, 0);
+    }
+
+    #[test]
+    fn prebroadcast_retry_requires_missing_marker_and_unchanged_wallet() {
+        let baseline = vec![WalletBaseline {
+            path: "grachi.json".to_owned(),
+            address: "0xc4bafd3866c0a4a1b5a44c4b3bc55d1735c0b507".to_owned(),
+            pending_nonce: 28,
+            nft_balance: 0,
+        }];
+        assert!(safe_prebroadcast_retry(true, &baseline, Some(&baseline)));
+        assert!(!safe_prebroadcast_retry(false, &baseline, Some(&baseline)));
+        assert!(!safe_prebroadcast_retry(true, &baseline, None));
+        let mut changed = baseline.clone();
+        changed[0].pending_nonce = 29;
+        assert!(!safe_prebroadcast_retry(true, &baseline, Some(&changed)));
+    }
+
+    #[test]
+    fn prebroadcast_retries_back_off_without_hammering_a_permanent_refusal() {
+        assert_eq!(prebroadcast_backoff_seconds(1), 5);
+        assert_eq!(prebroadcast_backoff_seconds(2), 10);
+        assert_eq!(prebroadcast_backoff_seconds(3), 20);
+        assert_eq!(prebroadcast_backoff_seconds(7), 300);
+        assert_eq!(prebroadcast_backoff_seconds(u32::MAX), 300);
+    }
+
+    #[test]
+    fn broadcast_marker_path_cannot_escape_state_directory() {
+        let state = Path::new("/var/lib/nock/exit-founders-grachi-cron.json");
+        let marker = broadcast_marker_path(state, "../exit-founders-gtd");
+        assert!(marker
+            .to_string_lossy()
+            .ends_with("2e2e2f657869742d666f756e646572732d677464"));
+    }
 
     #[test]
     fn manual_activity_is_detected_by_nonce_or_nft_balance() {

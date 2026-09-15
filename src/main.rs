@@ -72,6 +72,9 @@ enum Command {
         /// 0.05. Required when the stage is not free.
         #[arg(long, value_name = "ETH")]
         max_spend: Option<String>,
+        /// Internal cron safety marker, persisted before any broadcast attempt.
+        #[arg(long, hide = true, requires = "fire")]
+        broadcast_intent_file: Option<PathBuf>,
     },
     /// Watch configured mint stages and make one last-minute attempt if no
     /// manual transaction has used the wallet. Dry-run unless --fire is set.
@@ -148,6 +151,7 @@ async fn main() -> std::process::ExitCode {
             stage,
             fire,
             max_spend,
+            broadcast_intent_file,
         } => {
             let max_spend_wei = match max_spend.as_deref().map(plan::spend::parse_eth) {
                 Some(Ok(wei)) => Some(wei),
@@ -186,6 +190,7 @@ async fn main() -> std::process::ExitCode {
                     wallets,
                     stage,
                     fire,
+                    broadcast_intent_file,
                 },
             )
             .await

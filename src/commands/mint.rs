@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
@@ -41,7 +41,9 @@ use crate::wallet::set::{read_set_file, unlock, WalletEntry, WalletSet};
 /// the calldata is four words we assemble ourselves. A signed stage cannot be,
 /// because it needs a signature only `OpenSea` holds. So the third party sits on
 /// the money path exactly where it is unavoidable and nowhere else.
-const GAS_LIMIT: u64 = 320_000;
+/// A bounded signed gas ceiling. Unused gas is not charged, but the estimate
+/// must fit with 20% headroom before any transaction is broadcast.
+const GAS_LIMIT: u64 = 1_000_000;
 
 /// Preparation is done by here. After this the loop only waits and writes.
 const FREEZE_SECONDS: i64 = 30;
@@ -70,6 +72,9 @@ const PREFLIGHT_RETRIES: usize = 3;
 const PREFLIGHT_RETRY_DELAY: Duration = Duration::from_secs(1);
 const PREFLIGHT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const PREFLIGHT_OPEN_GRACE_SECONDS: u64 = 30;
+/// A stalled primary send must not hold the Alchemy and public fallbacks for
+/// eight seconds each. Re-sending the same signed bytes cannot mint twice.
+const SEND_ENDPOINT_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RetryPlan {
@@ -93,6 +98,8 @@ pub struct MintArgs<'a> {
     /// Which stage to enter. Without it the run takes the earliest one that has
     /// not ended.
     pub stage: Option<u64>,
+    /// Cron-only durable marker. If it cannot be written, sending is forbidden.
+    pub broadcast_intent_file: Option<PathBuf>,
 }
 
 pub struct EligibilityArgs<'a> {
@@ -243,7 +250,14 @@ async fn prepare_and_run(config: &Config, args: MintArgs<'_>) -> Result<ExitCode
         return Err("no wallet is ready for this stage, so there is nothing to send.".to_owned());
     }
 
-    fire_stage(config, rpc, &plan, &prepared).await
+    fire_stage(
+        config,
+        rpc,
+        &plan,
+        &prepared,
+        args.broadcast_intent_file.as_deref(),
+    )
+    .await
 }
 
 struct Prepared {
@@ -277,7 +291,8 @@ async fn prepare_wallet(
     input: PrepareInput<'_>,
 ) -> Prepared {
     let address = input.entry.address;
-    let (nonce, gas_price, balance) = chain_state(rpc, address).await.unwrap_or((0, 0, 0));
+    let chain = chain_state(rpc, address).await;
+    let (nonce, gas_price, balance) = chain.as_ref().copied().unwrap_or((0, 0, 0));
     let max_fee = gas_price.saturating_mul(2);
     let gas_ceiling_wei = u128::from(GAS_LIMIT).saturating_mul(max_fee);
     let quantity = input.quantity.min(input.stage.max_per_wallet.max(1));
@@ -293,6 +308,9 @@ async fn prepare_wallet(
         gas_ceiling_wei,
         supply_left: supply_left(rpc, input.collection).await,
     };
+    if let Err(error) = chain {
+        candidate.unavailable = Some(format!("wallet chain state unavailable: {error}"));
+    }
 
     let (calldata, value_wei) = if input.stage.is_signed() {
         match signed_calldata(http, &input, address, quantity).await {
@@ -689,7 +707,8 @@ async fn preflight_shots(rpc: &mut Rpc, shots: &[Shot]) -> Result<(), String> {
             "value": format!("0x{:x}", shot.value_wei),
             "data": format!("0x{}", hex::encode(&shot.calldata)),
         });
-        rpc.call::<String>("eth_estimateGas", json!([tx, "latest"]))
+        let estimate = rpc
+            .call::<String>("eth_estimateGas", json!([tx, "latest"]))
             .await
             .map_err(|e| {
                 format!(
@@ -697,8 +716,28 @@ async fn preflight_shots(rpc: &mut Rpc, shots: &[Shot]) -> Result<(), String> {
                     shot.index
                 )
             })?;
+        validate_gas_estimate(&estimate)
+            .map_err(|error| format!("preflight refused wallet {}: {error}", shot.index))?;
     }
     Ok(())
+}
+
+fn validate_gas_estimate(raw: &str) -> Result<u64, String> {
+    let estimate =
+        parse_hex_u64(raw).map_err(|error| format!("invalid gas estimate {raw}: {error}"))?;
+    if estimate == 0 {
+        return Err("zero gas estimate".to_owned());
+    }
+    let padded = estimate
+        .checked_mul(6)
+        .ok_or_else(|| "gas estimate overflow".to_owned())?
+        .div_ceil(5);
+    if padded > GAS_LIMIT {
+        return Err(format!(
+            "gas estimate {estimate} plus 20% headroom exceeds signed {GAS_LIMIT} gas limit"
+        ));
+    }
+    Ok(estimate)
 }
 
 async fn preflight_shots_through_open(
@@ -815,6 +854,7 @@ async fn fire_stage(
     mut rpc: Rpc,
     plan: &StagePlan,
     prepared: &[Prepared],
+    broadcast_intent_file: Option<&Path>,
 ) -> Result<ExitCode, String> {
     let clock = Clock::new();
     let open_at_ms = i64::try_from(plan.stage.start_time).unwrap_or(0) * 1_000;
@@ -850,11 +890,40 @@ async fn fire_stage(
     // refusal aborts the batch rather than letting the other wallets race into
     // a state we have not proved safe.
     preflight_shots_through_open(&mut rpc, &shots, plan.stage.start_time).await?;
+    if let Some(path) = broadcast_intent_file {
+        persist_broadcast_intent(path)?;
+    }
     let results = send_and_classify(config, &shots).await;
 
     drop(rpc);
     println!("{}", render_outcome_table(&results));
     Ok(exit_code(&results))
+}
+
+fn persist_broadcast_intent(path: &Path) -> Result<(), String> {
+    use std::io::Write;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| {
+            format!(
+                "cannot create broadcast-intent marker {}: {error}",
+                path.display()
+            )
+        })?;
+    file.write_all(b"broadcast-intent\n")
+        .map_err(|error| format!("cannot write broadcast-intent marker: {error}"))?;
+    file.sync_all()
+        .map_err(|error| format!("cannot sync broadcast-intent marker: {error}"))?;
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("cannot sync broadcast-intent directory: {error}"))?;
+    }
+    Ok(())
 }
 
 /// The stage to enter, and the `OpenSea` slug if the collection has one.
@@ -1095,7 +1164,7 @@ async fn send_to(urls: &[String], signed: &Signed) -> Sent {
     let mut notes = Vec::new();
 
     for url in urls {
-        let mut endpoint = Rpc::new(vec![url.clone()], Duration::from_secs(8));
+        let mut endpoint = Rpc::new(vec![url.clone()], SEND_ENDPOINT_TIMEOUT);
         match endpoint
             .call::<String>("eth_sendRawTransaction", json!([raw]))
             .await
@@ -1229,6 +1298,32 @@ mod tests {
             Some(Duration::from_secs(10))
         );
         assert_eq!(preflight_retry_plan(1_000, 1_031).max_attempts, Some(3));
+    }
+
+    #[test]
+    fn gas_estimate_requires_headroom_inside_signed_limit() {
+        assert_eq!(validate_gas_estimate("0xc3500"), Ok(800_000));
+        assert_eq!(validate_gas_estimate("0xcb735"), Ok(833_333));
+        assert!(validate_gas_estimate("0xcb736").is_err());
+        assert!(validate_gas_estimate("0xd59f8").is_err());
+        assert!(validate_gas_estimate("0x0").is_err());
+        assert!(validate_gas_estimate("not-hex").is_err());
+        assert!(validate_gas_estimate("0xffffffffffffffff").is_err());
+    }
+
+    #[test]
+    fn durable_broadcast_intent_prevents_a_second_send() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "nock-broadcast-intent-test-{}-{unique}",
+            std::process::id()
+        ));
+        assert!(persist_broadcast_intent(&path).is_ok());
+        assert!(persist_broadcast_intent(&path).is_err());
+        std::fs::remove_file(path).unwrap();
     }
 
     // The Goat Street rule. Only a refusal is an answer; a 429, a dropped
