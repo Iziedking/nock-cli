@@ -231,7 +231,19 @@ async fn run_inner(config: &Config, args: CronArgs) -> Result<(), String> {
             passphrase: passphrase.as_ref(),
         };
         for job in &spec.jobs {
-            changed |= process_job(&context, job, &mut state, now).await?;
+            // A scheduled phase is an independent attempt. A refusal, a
+            // transient RPC/OpenSea error, a nonce problem, or a child
+            // process failure in one phase must not terminate the scheduler
+            // before later phases get their own opening window.
+            match process_job(&context, job, &mut state, now).await {
+                Ok(job_changed) => changed |= job_changed,
+                Err(why) => {
+                    eprintln!("  [{}] job error; keeping other jobs alive: {why}", job.id);
+                    let job_state = state.jobs.entry(job.id.clone()).or_default();
+                    job_state.last_action = Some("job_error; will retry independently".to_owned());
+                    changed = true;
+                }
+            }
         }
         if changed {
             write_state(&state_path, &state)?;
