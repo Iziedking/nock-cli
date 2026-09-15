@@ -38,6 +38,16 @@ struct Cli {
 enum Command {
     /// Check the chain, the sequencer, the clock and the wallet before you need them.
     Doctor,
+    /// Sign in to `OpenSea` and print wallet eligibility for every phase. Never broadcasts.
+    Eligibility {
+        /// An `OpenSea` collection link or slug.
+        collection: String,
+        #[arg(long, short)]
+        wallet: Option<PathBuf>,
+        /// A file of keystore paths, one per line.
+        #[arg(long, conflicts_with = "wallet")]
+        wallet_set: Option<PathBuf>,
+    },
     /// Mint a public stage for yourself. Prints what it would do unless --fire.
     Mint {
         /// The NFT contract address.
@@ -125,6 +135,11 @@ async fn main() -> std::process::ExitCode {
 
     match cli.command {
         Command::Doctor => commands::doctor::run(&config).await,
+        Command::Eligibility {
+            collection,
+            wallet,
+            wallet_set,
+        } => run_eligibility_command(&config, collection, wallet, wallet_set).await,
         Command::Mint {
             collection,
             quantity,
@@ -203,4 +218,28 @@ async fn main() -> std::process::ExitCode {
             }
         }
     }
+}
+
+async fn run_eligibility_command(
+    config: &Config,
+    collection: String,
+    wallet: Option<PathBuf>,
+    wallet_set: Option<PathBuf>,
+) -> std::process::ExitCode {
+    let single = wallet.or_else(|| wallet_set.is_none().then(commands::wallets::default_path));
+    let wallets = match commands::mint::wallet_paths(single.as_ref(), wallet_set.as_ref()) {
+        Ok(paths) => paths,
+        Err(message) => {
+            eprintln!("\n  {message}\n");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    commands::mint::eligibility(
+        config,
+        commands::mint::EligibilityArgs {
+            collection: &collection,
+            wallets,
+        },
+    )
+    .await
 }

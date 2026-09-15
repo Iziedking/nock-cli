@@ -95,6 +95,11 @@ pub struct MintArgs<'a> {
     pub stage: Option<u64>,
 }
 
+pub struct EligibilityArgs<'a> {
+    pub collection: &'a str,
+    pub wallets: Vec<PathBuf>,
+}
+
 pub async fn run(config: &Config, args: MintArgs<'_>) -> ExitCode {
     match prepare_and_run(config, args).await {
         Ok(code) => code,
@@ -102,6 +107,64 @@ pub async fn run(config: &Config, args: MintArgs<'_>) -> ExitCode {
             eprintln!("\n  {message}\n");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Read the wallet-specific `OpenSea` answer for every phase without requesting
+/// mint calldata. This is deliberately separate from `mint`: eligibility is a
+/// useful preflight result even while a stage is still closed.
+pub async fn eligibility(config: &Config, args: EligibilityArgs<'_>) -> ExitCode {
+    match eligibility_report(config, args).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(message) => {
+            eprintln!("\n  {message}\n");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn eligibility_report(_config: &Config, args: EligibilityArgs<'_>) -> Result<(), String> {
+    let wallets = unlock_all(&args.wallets)?;
+    println!("\n  {} wallet(s) unlocked", wallets.entries.len());
+
+    let http = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 nock")
+        .build()
+        .map_err(|e| format!("could not build an HTTP client: {e}"))?;
+    let (collection, slug) = resolve_collection(&http, args.collection).await?;
+    let slug = slug.ok_or_else(|| {
+        "eligibility needs an OpenSea collection link or slug, not only a contract address"
+            .to_owned()
+    })?;
+    println!("  {slug} resolves to {collection:?}");
+
+    for entry in &wallets.entries {
+        let stages = read_eligibility(&http, &slug, entry.address, &entry.secret)
+            .await
+            .map_err(|e| format!("wallet {}: {e}", entry.index))?;
+        println!("  wallet {} ({:?})", entry.index, entry.address);
+        for stage in stages {
+            println!(
+                "    stage {} ({}) eligible={} cap={} price={}",
+                stage.stage_index,
+                stage_type_name(stage.stage_type),
+                stage.is_eligible,
+                stage
+                    .max_total_mintable_by_wallet
+                    .map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
+                stage.quoted_price.as_deref().unwrap_or("unknown")
+            );
+        }
+    }
+    println!("\n  Nothing was signed or sent.");
+    Ok(())
+}
+
+fn stage_type_name(stage_type: StageType) -> &'static str {
+    match stage_type {
+        StageType::PublicSale => "public",
+        StageType::SignedPresale => "signed",
+        StageType::MerklePresale => "merkle",
     }
 }
 
@@ -304,8 +367,22 @@ impl CalldataFailure {
 /// and silence must never be reported as ineligibility. Erring this way is the
 /// safe direction: calling a real refusal "unknown" costs a line of report,
 /// while calling silence a refusal costs the mint and blames the user.
-const fn is_an_answer(error: &gql::GqlError) -> bool {
-    matches!(error, gql::GqlError::Refused(_))
+fn is_an_answer(error: &gql::GqlError) -> bool {
+    match error {
+        gql::GqlError::Refused(reason) => !is_stage_not_open_reason(reason),
+        _ => false,
+    }
+}
+
+fn is_stage_not_open_reason(reason: &str) -> bool {
+    let compact = reason
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    compact.contains("dropnotmintingerror")
+        || compact.contains("mintstagenotopen")
+        || compact.contains("mintnotstarted")
 }
 
 /// Calldata for a signed stage, which is the only thing `OpenSea` is asked for.
@@ -324,21 +401,9 @@ async fn signed_calldata(
         )
     })?;
 
-    let session: Session = authenticate(http, address, &input.entry.secret, 4663)
+    let (session, eligibility) = read_eligibility_session(http, slug, address, &input.entry.secret)
         .await
-        .map_err(|e| CalldataFailure::Unavailable(format!("could not sign in to OpenSea: {e}")))?;
-
-    let body = gql::post(
-        http,
-        DROP_ELIGIBILITY,
-        json!({ "collectionSlug": slug, "address": format!("{address:?}") }),
-        Some(&session),
-    )
-    .await
-    .map_err(|e| CalldataFailure::Unavailable(format!("could not read eligibility: {e}")))?;
-
-    let eligibility = gql::parse_eligibility(&body)
-        .map_err(|e| CalldataFailure::Unavailable(format!("could not read eligibility: {e}")))?;
+        .map_err(CalldataFailure::Unavailable)?;
     let mine = eligibility
         .iter()
         .find(|e| e.stage_index == input.stage.index)
@@ -385,6 +450,38 @@ async fn signed_calldata(
         Ok(_) => Ok((submission.data, submission.value_wei, None)),
         Err(refusal) => Ok((Vec::new(), 0, Some(refusal))),
     }
+}
+
+async fn read_eligibility(
+    http: &reqwest::Client,
+    slug: &str,
+    address: Address,
+    secret: &Zeroizing<[u8; 32]>,
+) -> Result<Vec<gql::Eligibility>, String> {
+    let (_, eligibility) = read_eligibility_session(http, slug, address, secret).await?;
+    Ok(eligibility)
+}
+
+async fn read_eligibility_session(
+    http: &reqwest::Client,
+    slug: &str,
+    address: Address,
+    secret: &Zeroizing<[u8; 32]>,
+) -> Result<(Session, Vec<gql::Eligibility>), String> {
+    let session: Session = authenticate(http, address, secret, 4663)
+        .await
+        .map_err(|e| format!("could not sign in to OpenSea: {e}"))?;
+    let body = gql::post(
+        http,
+        DROP_ELIGIBILITY,
+        json!({ "collectionSlug": slug, "address": format!("{address:?}") }),
+        Some(&session),
+    )
+    .await
+    .map_err(|e| format!("could not read eligibility: {e}"))?;
+    let eligibility =
+        gql::parse_eligibility(&body).map_err(|e| format!("could not read eligibility: {e}"))?;
+    Ok((session, eligibility))
 }
 
 /// Ask `OpenSea` for the transaction it would actually give the web UI.
@@ -1150,6 +1247,19 @@ mod tests {
             "Too Many Requests".to_owned()
         )));
         assert!(!is_an_answer(&gql::GqlError::Missing("actions")));
+    }
+
+    #[test]
+    fn a_closed_stage_is_not_reported_as_wallet_ineligibility() {
+        assert!(!is_an_answer(&gql::GqlError::Refused(
+            "DropNotMintingError".to_owned()
+        )));
+        assert!(!is_an_answer(&gql::GqlError::Refused(
+            "MintStageNotOpen".to_owned()
+        )));
+        assert!(is_an_answer(&gql::GqlError::Refused(
+            "MintWalletIneligible".to_owned()
+        )));
     }
 
     #[test]

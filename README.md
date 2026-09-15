@@ -198,6 +198,21 @@ the run takes the earliest one that has not ended.
 nock mint 0xCollection --stage 2 --wallet wallets/main.json
 ```
 
+### Check eligibility without minting
+
+OpenSea eligibility is wallet-specific and can be read for every phase before a
+phase opens. The command signs in to OpenSea with the encrypted keystore, prints
+each phase's eligibility and wallet cap, and never requests mint calldata or
+broadcasts a transaction:
+
+```bash
+nock eligibility https://opensea.io/collection/mr-machine --wallet wallets/main.json
+```
+
+An address by itself cannot answer this question because OpenSea requires the
+matching wallet signature. A closed stage is reported as not yet mintable, not
+as proof that the wallet is ineligible.
+
 ## Last-minute cron protection
 
 If you do not want to be online at the exact opening time, `nock cron` can

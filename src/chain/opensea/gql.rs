@@ -350,7 +350,26 @@ struct WirePrice {
 
 #[derive(Deserialize)]
 struct WireToken {
-    unit: Option<String>,
+    unit: Option<WireUnit>,
+}
+
+/// `OpenSea` has returned this advisory display value as both a string and a
+/// JSON number. It is never used to price a transaction, but rejecting the
+/// numeric form would turn an unknown eligibility answer into a false refusal.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum WireUnit {
+    Text(String),
+    Number(serde_json::Number),
+}
+
+impl WireUnit {
+    fn into_string(self) -> String {
+        match self {
+            Self::Text(value) => value,
+            Self::Number(value) => value.to_string(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -519,7 +538,11 @@ pub fn parse_eligibility(json: &str) -> Result<Vec<Eligibility>, GqlError> {
                     .eligible_minter_address
                     .and_then(|a| a.parse::<Address>().ok()),
                 max_total_mintable_by_wallet: s.eligible_max,
-                quoted_price: s.eligible_price.and_then(|p| p.token).and_then(|t| t.unit),
+                quoted_price: s
+                    .eligible_price
+                    .and_then(|p| p.token)
+                    .and_then(|t| t.unit)
+                    .map(WireUnit::into_string),
             })
         })
         .collect()
@@ -777,6 +800,18 @@ mod tests {
         let changed = ELIGIBILITY.replacen("\"isEligible\": null", "\"isEligible\": true", 1);
         let all = parse_eligibility(&changed).unwrap();
         assert_eq!(all.iter().filter(|e| e.is_eligible).count(), 1);
+    }
+
+    #[test]
+    fn it_accepts_openseas_numeric_free_price_without_refusing_eligibility() {
+        let changed = ELIGIBILITY
+            .replacen("\"isEligible\": null", "\"isEligible\": true", 1)
+            .replace(
+                "\"eligiblePrice\": null",
+                "\"eligiblePrice\": {\"token\": {\"unit\": 0.0}}",
+            );
+        let all = parse_eligibility(&changed).unwrap();
+        assert_eq!(all[0].quoted_price.as_deref(), Some("0.0"));
     }
 
     // Not signing in is an ordinary state with its own message, not a wall of
