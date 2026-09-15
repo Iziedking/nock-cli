@@ -505,7 +505,19 @@ async fn process_job(
                 current.clone()
             }
         };
+        let terminal_refusal = terminal_stage_refusal(&child.stdout, &child.stderr);
+        if let Some(reason) = terminal_refusal {
+            job_state.attempted = true;
+            job_state.retry_after = 0;
+            job_state.prebroadcast_failures = 0;
+            job_state.last_action = Some(format!("terminal_refusal_{reason}"));
+            println!(
+                "  [{}] definitive OpenSea refusal ({reason}); this phase is closed without a broadcast",
+                job.id
+            );
+        }
         let safe_retry = safe_prebroadcast_retry(
+            terminal_refusal.is_none(),
             marker_absent(&marker)?,
             &current,
             post_result.as_ref().ok().map(Vec::as_slice),
@@ -796,11 +808,19 @@ fn marker_absent(path: &Path) -> Result<bool, String> {
 }
 
 fn safe_prebroadcast_retry(
+    retryable: bool,
     marker_missing: bool,
     before: &[WalletBaseline],
     after: Option<&[WalletBaseline]>,
 ) -> bool {
-    marker_missing && after.is_some_and(|snapshot| snapshot == before)
+    retryable && marker_missing && after.is_some_and(|snapshot| snapshot == before)
+}
+
+fn terminal_stage_refusal(stdout: &str, stderr: &str) -> Option<&'static str> {
+    [stdout, stderr]
+        .into_iter()
+        .any(|output| output.contains("InsufficientMintsRemainingError"))
+        .then_some("InsufficientMintsRemainingError")
 }
 
 fn prebroadcast_backoff_seconds(failures: u32) -> u64 {
@@ -1059,12 +1079,43 @@ mod tests {
             pending_nonce: 28,
             nft_balance: 0,
         }];
-        assert!(safe_prebroadcast_retry(true, &baseline, Some(&baseline)));
-        assert!(!safe_prebroadcast_retry(false, &baseline, Some(&baseline)));
-        assert!(!safe_prebroadcast_retry(true, &baseline, None));
+        assert!(safe_prebroadcast_retry(
+            true,
+            true,
+            &baseline,
+            Some(&baseline)
+        ));
+        assert!(!safe_prebroadcast_retry(
+            false,
+            true,
+            &baseline,
+            Some(&baseline)
+        ));
+        assert!(!safe_prebroadcast_retry(true, true, &baseline, None));
         let mut changed = baseline.clone();
         changed[0].pending_nonce = 29;
-        assert!(!safe_prebroadcast_retry(true, &baseline, Some(&changed)));
+        assert!(!safe_prebroadcast_retry(
+            true,
+            true,
+            &baseline,
+            Some(&changed)
+        ));
+    }
+
+    #[test]
+    fn definitive_opensea_refusal_is_terminal_not_retryable() {
+        assert_eq!(
+            terminal_stage_refusal(
+                "wallet 0: OpenSea will not build this mint: InsufficientMintsRemainingError",
+                ""
+            ),
+            Some("InsufficientMintsRemainingError")
+        );
+        assert_eq!(terminal_stage_refusal("Too Many Requests", ""), None);
+        assert_eq!(
+            terminal_stage_refusal("no wallet is ready for this stage", ""),
+            None
+        );
     }
 
     #[test]
